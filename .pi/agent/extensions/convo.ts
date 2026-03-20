@@ -21,6 +21,7 @@ interface ConvoState {
 	answers: ConvoAnswer[];
 	progressCurrent?: number;
 	progressTotal?: number;
+	questionnaireRetryCount?: number;
 }
 
 interface ConvoBatchResultDetails {
@@ -34,7 +35,7 @@ const STATE_ENTRY = "convo-state";
 const STATUS_ID = "convo-mode";
 const WIDGET_ID = "convo-mode";
 const COMPLETE_MARKER = "[CONVO_COMPLETE]";
-const FALLBACK_OPTION = "Not sure, give me more detail";
+const FALLBACK_OPTION = "Other";
 const SESSION_CONTEXT_SEED = "Use the existing session context so far.";
 const SUMMARY_HEADINGS = ["goal", "requirements", "constraints", "assumptions", "implementation plan", "open questions"] as const;
 const RESOLVED_OPEN_QUESTIONS = ["none", "n/a", "na", "no open questions", "no unresolved questions", "none at this time"];
@@ -48,11 +49,30 @@ const IMPLEMENTATION_INTENT = [
 	/^(can|could|would|will)\s+you\s+.*\b(implement|build|code|write)\b/i,
 ];
 
+const CLARIFICATION_REQUEST_PHRASES = [
+	"i need a few more details",
+	"i need a few more specifics",
+	"i need more details",
+	"i need more information",
+	"i need a bit more information",
+	"i need a little more information",
+	"i need a few more pieces of information",
+	"i have a few questions",
+	"i have a couple of questions",
+	"a few quick questions",
+	"a couple of quick questions",
+	"before i can proceed",
+	"before i can implement",
+	"to make the project concrete",
+	"to make this project concrete",
+	"to make this concrete",
+] as const;
+
 const ConvoQuestionSchema = Type.Object({
 	id: Type.Optional(Type.String({ description: "Stable identifier for this question within the batch." })),
 	question: Type.String({ description: "The clarification question to ask the user." }),
 	options: Type.Array(Type.String({ description: "A selectable answer option." }), {
-		description: "Three to five concrete answer choices. Include only concrete options; the extension adds a 'Not sure, give me more detail' fallback if needed.",
+		description: "Three to five concrete answer choices. Include only concrete options; the extension adds an 'Other' fallback if needed.",
 	}),
 });
 
@@ -93,18 +113,27 @@ function clamp(value: number, min: number, max: number): number {
 	return Math.max(min, Math.min(max, value));
 }
 
+function normalizeProgressValue(value: unknown): number | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+	return Math.max(1, Math.floor(value));
+}
+
 function normalizeOptions(options: string[]): string[] {
 	const cleaned = options
 		.map((option) => option.trim())
 		.filter((option, index, arr) => option.length > 0 && arr.indexOf(option) === index);
 
 	if (
-		!cleaned.some(
-			(option) =>
-				option.toLowerCase().includes("not sure") ||
-				option.toLowerCase().includes("more detail") ||
-				option.toLowerCase().includes("none of these"),
-		)
+		!cleaned.some((option) => {
+			const normalized = option.toLowerCase();
+			return (
+				normalized === "other" ||
+				normalized.startsWith("other ") ||
+				normalized.includes("not sure") ||
+				normalized.includes("more detail") ||
+				normalized.includes("none of these")
+			);
+		})
 	) {
 		cleaned.push(FALLBACK_OPTION);
 	}
@@ -284,13 +313,20 @@ function looksInsufficientContext(text: string): boolean {
 	].some((phrase) => normalized.includes(phrase));
 }
 
+function looksLikeClarificationRequest(text: string): boolean {
+	const normalized = text.toLowerCase();
+	return CLARIFICATION_REQUEST_PHRASES.some((phrase) => normalized.includes(phrase)) || text.includes("?");
+}
+
 export default function convoExtension(pi: ExtensionAPI) {
 	let state: ConvoState = {
 		active: false,
 		seed: "",
 		useExistingContext: false,
 		answers: [],
+		questionnaireRetryCount: 0,
 	};
+	let usedQuestionnaireThisAgentRun = false;
 
 	function persistState(): void {
 		pi.appendEntry(STATE_ENTRY, { ...state });
@@ -336,6 +372,7 @@ export default function convoExtension(pi: ExtensionAPI) {
 			seed: "",
 			useExistingContext: false,
 			answers: [],
+			questionnaireRetryCount: 0,
 		};
 
 		const entries = ctx.sessionManager.getBranch();
@@ -367,6 +404,10 @@ export default function convoExtension(pi: ExtensionAPI) {
 					typeof entry.data?.progressTotal === "number"
 						? Math.max(1, Math.floor(entry.data.progressTotal))
 						: undefined,
+				questionnaireRetryCount:
+					typeof entry.data?.questionnaireRetryCount === "number"
+						? Math.max(0, Math.floor(entry.data.questionnaireRetryCount))
+						: 0,
 			};
 			break;
 		}
@@ -376,7 +417,7 @@ export default function convoExtension(pi: ExtensionAPI) {
 
 	function exitConvo(ctx: ExtensionContext, message = "Exited convo mode."): void {
 		if (!state.active) return;
-		state = { ...state, active: false };
+		state = { ...state, active: false, questionnaireRetryCount: 0 };
 		persistState();
 		updateUI(ctx);
 		ctx.ui.notify(message, "info");
@@ -391,6 +432,7 @@ export default function convoExtension(pi: ExtensionAPI) {
 			answers: [],
 			progressCurrent: undefined,
 			progressTotal: undefined,
+			questionnaireRetryCount: 0,
 		};
 		persistState();
 		updateUI(ctx);
@@ -475,9 +517,16 @@ export default function convoExtension(pi: ExtensionAPI) {
 			}
 
 			const history = state.answers.map((answer) => ({ ...answer, options: [...answer.options] }));
-			const baseProgress = Math.max(1, history.length + 1);
+			const fallbackProgressCurrent = Math.max(1, history.length + 1);
+			const baseProgress = Math.max(
+				fallbackProgressCurrent,
+				normalizeProgressValue(input.progressCurrent) ?? fallbackProgressCurrent,
+			);
 			const minimumTotalProgress = baseProgress + batch.length - 1;
-			const totalProgress = Math.max(minimumTotalProgress, input.progressTotal ?? Math.max(5, minimumTotalProgress));
+			const totalProgress = Math.max(
+				minimumTotalProgress,
+				normalizeProgressValue(input.progressTotal) ?? Math.max(5, minimumTotalProgress),
+			);
 
 			const newPages: ConvoAnswer[] = batch.map((question, index) => {
 				const options = normalizeOptions(question.options);
@@ -722,6 +771,7 @@ export default function convoExtension(pi: ExtensionAPI) {
 				answers,
 				progressCurrent: undefined,
 				progressTotal: undefined,
+				questionnaireRetryCount: 0,
 			};
 			persistState();
 			updateUI(ctx);
@@ -744,16 +794,24 @@ export default function convoExtension(pi: ExtensionAPI) {
 				progressTotal?: number;
 			};
 			const questions = Array.isArray(input.questions) ? input.questions : [];
-			const progressCurrent = Math.max(1, state.answers.length + 1);
-			const minimumProgressTotal = Math.max(progressCurrent, progressCurrent + Math.max(0, questions.length - 1));
-			const progressTotal =
-				typeof input.progressTotal === "number" && input.progressTotal > 0
-					? Math.max(minimumProgressTotal, input.progressTotal)
-					: undefined;
+			const fallbackProgressCurrent = Math.max(1, state.answers.length + 1);
+			const progressCurrent = Math.max(
+				fallbackProgressCurrent,
+				normalizeProgressValue(input.progressCurrent) ?? fallbackProgressCurrent,
+			);
+			const progressEnd = progressCurrent + Math.max(0, questions.length - 1);
+			const minimumProgressTotal = Math.max(progressCurrent, progressEnd);
+			const progressTotal = normalizeProgressValue(input.progressTotal);
+			const resolvedProgressTotal = progressTotal ? Math.max(minimumProgressTotal, progressTotal) : undefined;
+			const progressLabel = resolvedProgressTotal
+				? questions.length > 1
+					? `${progressCurrent}-${progressEnd}/${resolvedProgressTotal}`
+					: `${progressCurrent}/${resolvedProgressTotal}`
+				: "";
 			const label = questions.length === 1 ? questions[0]?.question || "Question" : `${questions.length} questions`;
 			return new Text(
 				theme.fg("toolTitle", theme.bold("convo_questionnaire ")) +
-					(progressTotal ? theme.fg("accent", `${progressCurrent}/${progressTotal} `) : "") +
+					(progressLabel ? theme.fg("accent", `${progressLabel} `) : "") +
 					theme.fg("muted", label),
 				0,
 				0,
@@ -787,8 +845,21 @@ export default function convoExtension(pi: ExtensionAPI) {
 		restoreState(ctx);
 	});
 
+	pi.on("agent_start", async () => {
+		usedQuestionnaireThisAgentRun = false;
+	});
+
+	pi.on("tool_execution_end", async (event) => {
+		if (!state.active || event.isError) return;
+		if (event.toolName === "convo_questionnaire") usedQuestionnaireThisAgentRun = true;
+	});
+
 	pi.on("input", async (event, ctx) => {
 		if (!state.active || event.source === "extension") return { action: "continue" as const };
+		if ((state.questionnaireRetryCount ?? 0) !== 0) {
+			state = { ...state, questionnaireRetryCount: 0 };
+			persistState();
+		}
 		if (looksLikeImplementationIntent(event.text.trim())) exitConvo(ctx, "Exited convo mode. Moving on from discovery.");
 		return { action: "continue" as const };
 	});
@@ -818,12 +889,41 @@ export default function convoExtension(pi: ExtensionAPI) {
 		}
 
 		if (hasSummaryShape(text) && hasUnresolvedOpenQuestions(text)) {
+			state = { ...state, questionnaireRetryCount: 0 };
+			persistState();
 			if (ctx.hasUI) ctx.ui.notify("Convo summary still has open questions. Continuing refinement.", "info");
 			pi.sendUserMessage(
-				"Your last summary still listed unresolved open questions. Convo is not complete until Open questions is None. Ask the next batch of highest-value clarification questions, or resolve the gaps with reasonable assumptions and update the summary.",
+				"Your last summary still listed unresolved open questions. Convo is not complete until Open questions is None. Ask the next batch of highest-value clarification questions using convo_questionnaire, or resolve the gaps with reasonable assumptions and update the summary.",
 				{ deliverAs: "followUp" },
 			);
 			return;
+		}
+
+		if (!usedQuestionnaireThisAgentRun && looksLikeClarificationRequest(text)) {
+			const retryCount = state.questionnaireRetryCount ?? 0;
+			if (retryCount >= 1) {
+				if (ctx.hasUI) {
+					ctx.ui.notify(
+						"Convo still needs clarification, but no questionnaire was produced. Add more context or rerun /convo.",
+						"warning",
+					);
+				}
+				return;
+			}
+
+			state = { ...state, questionnaireRetryCount: retryCount + 1 };
+			persistState();
+			if (ctx.hasUI) ctx.ui.notify("Convo needs clarification. Requesting a questionnaire.", "info");
+			pi.sendUserMessage(
+				"You still need more information. Do not stop with prose or plain chat questions. Call convo_questionnaire now with the next batch of highest-value clarification questions.",
+				{ deliverAs: "followUp" },
+			);
+			return;
+		}
+
+		if ((state.questionnaireRetryCount ?? 0) !== 0) {
+			state = { ...state, questionnaireRetryCount: 0 };
+			persistState();
 		}
 
 		if (!looksComplete(text)) return;
@@ -846,7 +946,7 @@ export default function convoExtension(pi: ExtensionAPI) {
 		}
 
 		if (choice === "Keep refining") {
-			pi.sendUserMessage("Keep refining this. Ask the next batch of highest-value clarification questions.");
+			pi.sendUserMessage("Keep refining this. Ask the next batch of highest-value clarification questions using convo_questionnaire.");
 			return;
 		}
 
