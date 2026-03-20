@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -401,11 +401,25 @@ function mergeManagedSections(rawFile: string | undefined, store: MemoryStore): 
 	return `${merged.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd()}\n`;
 }
 
+async function resolveStoreWritePath(): Promise<string> {
+	try {
+		return await realpath(STORE_PATH);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException | undefined)?.code;
+		if (code === "ENOENT") {
+			return STORE_PATH;
+		}
+		throw error;
+	}
+}
+
 async function writeStoreFile(content: string): Promise<void> {
 	await mkdir(dirname(STORE_PATH), { recursive: true });
-	const tempPath = `${STORE_PATH}.${process.pid}.tmp`;
+	const targetPath = await resolveStoreWritePath();
+	await mkdir(dirname(targetPath), { recursive: true });
+	const tempPath = `${targetPath}.${process.pid}.tmp`;
 	await writeFile(tempPath, content, "utf8");
-	await rename(tempPath, STORE_PATH);
+	await rename(tempPath, targetPath);
 }
 
 async function saveStore(store: MemoryStore, rawFile?: string): Promise<void> {
