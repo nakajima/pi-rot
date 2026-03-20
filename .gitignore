@@ -1,0 +1,26 @@
+# Local scratch notes
+PLAN.md
+
+# Common local/env files
+.DS_Store
+.env
+.env.*
+*.log
+*.tmp
+
+# Secrets and credentials
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Dependency / build output
+node_modules/
+dist/
+build/
+coverage/
+
+# Local pi runtime state if it ever shows up here
+.pi/agent/global-memories.json
+.pi/agent/sessions/

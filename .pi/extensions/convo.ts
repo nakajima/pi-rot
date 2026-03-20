@@ -1,0 +1,753 @@
+import { CustomEditor, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
+import { Editor, type EditorTheme, Text, matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+
+interface ConvoAnswer {
+	id: string;
+	question: string;
+	options: string[];
+	selectedIndex: number;
+	selectedLabel: string;
+	note: string;
+	progressCurrent: number;
+	progressTotal: number;
+}
+
+interface ConvoState {
+	active: boolean;
+	seed: string;
+	useExistingContext?: boolean;
+	startedAt?: number;
+	answers: ConvoAnswer[];
+	progressCurrent?: number;
+	progressTotal?: number;
+}
+
+interface ConvoBatchResultDetails {
+	cancelled: boolean;
+	exited: boolean;
+	answers: ConvoAnswer[];
+	current?: ConvoAnswer;
+}
+
+const STATE_ENTRY = "convo-state";
+const STATUS_ID = "convo-mode";
+const WIDGET_ID = "convo-mode";
+const COMPLETE_MARKER = "[CONVO_COMPLETE]";
+const FALLBACK_OPTION = "Not sure, give me more detail";
+const SESSION_CONTEXT_SEED = "Use the existing session context so far.";
+
+const IMPLEMENTATION_INTENT = [
+	/\bgo ahead\b/i,
+	/\bstart coding\b/i,
+	/\bwrite the code\b/i,
+	/\bship it\b/i,
+	/\blet'?s do it\b/i,
+	/^(can|could|would|will)\s+you\s+.*\b(implement|build|code|write)\b/i,
+];
+
+const ConvoQuestionSchema = Type.Object({
+	id: Type.Optional(Type.String({ description: "Stable identifier for this question within the batch." })),
+	question: Type.String({ description: "The clarification question to ask the user." }),
+	options: Type.Array(Type.String({ description: "A selectable answer option." }), {
+		description: "Three to five concrete answer choices. Include only concrete options; the extension adds a 'Not sure, give me more detail' fallback if needed.",
+	}),
+});
+
+const ConvoQuestionnaireParams = Type.Object({
+	questions: Type.Array(ConvoQuestionSchema, {
+		description: "A batch of clarification questions to ask in one local questionnaire pass.",
+	}),
+	progressCurrent: Type.Optional(Type.Integer({ description: "Current step number for the first question in this batch, e.g. 3 for question 3/N." })),
+	progressTotal: Type.Optional(Type.Integer({ description: "Estimated total number of questions across the whole discovery flow, e.g. N for question 3/N." })),
+});
+
+class ConvoEditor extends CustomEditor {
+	isConvoActive: () => boolean = () => false;
+	onExitConvo: () => void = () => {};
+
+	override handleInput(data: string): void {
+		if (matchesKey(data, "ctrl+c") && this.isConvoActive()) {
+			this.onExitConvo();
+			return;
+		}
+		super.handleInput(data);
+	}
+
+	override render(width: number): string[] {
+		const lines = super.render(width);
+		if (!this.isConvoActive() || lines.length === 0) return lines;
+
+		const label = " CONVO ";
+		const last = lines.length - 1;
+		if (visibleWidth(lines[last]!) >= label.length) {
+			lines[last] = truncateToWidth(lines[last]!, width - label.length, "") + label;
+		}
+		return lines;
+	}
+}
+
+function clamp(value: number, min: number, max: number): number {
+	return Math.max(min, Math.min(max, value));
+}
+
+function normalizeOptions(options: string[]): string[] {
+	const cleaned = options
+		.map((option) => option.trim())
+		.filter((option, index, arr) => option.length > 0 && arr.indexOf(option) === index);
+
+	if (
+		!cleaned.some(
+			(option) =>
+				option.toLowerCase().includes("not sure") ||
+				option.toLowerCase().includes("more detail") ||
+				option.toLowerCase().includes("none of these"),
+		)
+	) {
+		cleaned.push(FALLBACK_OPTION);
+	}
+
+	return cleaned.length > 0 ? cleaned : [FALLBACK_OPTION];
+}
+
+function sanitizeAnswer(input: ConvoAnswer): ConvoAnswer {
+	const options = normalizeOptions(input.options);
+	const selectedIndex = clamp(input.selectedIndex, 0, Math.max(0, options.length - 1));
+	return {
+		...input,
+		question: input.question.trim(),
+		options,
+		selectedIndex,
+		selectedLabel: options[selectedIndex] ?? input.selectedLabel.trim(),
+		note: input.note,
+		progressCurrent: Math.max(1, input.progressCurrent),
+		progressTotal: Math.max(Math.max(1, input.progressCurrent), input.progressTotal),
+	};
+}
+
+function formatAnswerForModel(answer: ConvoAnswer, index: number): string {
+	const lines = [
+		`${index + 1}. Question: ${answer.question}`,
+		`   Options shown: ${answer.options.map((option, optionIndex) => `${optionIndex + 1}. ${option}`).join(" | ")}`,
+		`   Selected: ${answer.selectedIndex + 1}. ${answer.selectedLabel}`,
+	];
+	if (answer.note.trim()) lines.push(`   Additional context: ${answer.note.trim()}`);
+	return lines.join("\n");
+}
+
+function buildToolContent(answers: ConvoAnswer[]): string {
+	const lines = ["Structured answer history:"];
+	for (let i = 0; i < answers.length; i++) {
+		lines.push(formatAnswerForModel(answers[i]!, i));
+	}
+	return lines.join("\n");
+}
+
+function getMessageText(message: { content?: unknown }): string {
+	if (typeof message.content === "string") return message.content.trim();
+	if (!Array.isArray(message.content)) return "";
+	return message.content
+		.filter((part): part is { type?: string; text?: string } => typeof part === "object" && part !== null)
+		.filter((part) => part.type === "text" && typeof part.text === "string")
+		.map((part) => part.text)
+		.join("\n")
+		.trim();
+}
+
+function hasMeaningfulSessionContext(ctx: ExtensionContext): boolean {
+	const branch = ctx.sessionManager.getBranch();
+	let totalChars = 0;
+	let userMessages = 0;
+
+	for (const entry of branch) {
+		const messageEntry = entry as { type?: string; message?: { role?: string; content?: unknown } };
+		if (messageEntry.type !== "message" || !messageEntry.message) continue;
+		const role = messageEntry.message.role;
+		if (role !== "user" && role !== "assistant") continue;
+		const text = getMessageText(messageEntry.message);
+		if (!text) continue;
+		totalChars += text.length;
+		if (role === "user") userMessages++;
+	}
+
+	return userMessages > 0 && totalChars >= 40;
+}
+
+function getLastAssistantText(messages: Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>): string {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+		return message.content
+			.filter((part) => part?.type === "text" && typeof part.text === "string")
+			.map((part) => part.text)
+			.join("\n");
+	}
+	return "";
+}
+
+function looksLikeImplementationIntent(text: string): boolean {
+	return IMPLEMENTATION_INTENT.some((pattern) => pattern.test(text));
+}
+
+function looksComplete(text: string): boolean {
+	if (text.includes(COMPLETE_MARKER)) return true;
+
+	const normalized = text.toLowerCase();
+	if (!normalized.includes("implementation plan")) return false;
+
+	const headings = ["goal", "requirements", "constraints", "assumptions", "open questions"];
+	return headings.filter((heading) => normalized.includes(heading)).length >= 3;
+}
+
+function looksInsufficientContext(text: string): boolean {
+	const normalized = text.toLowerCase();
+	return [
+		"not enough context",
+		"don't have enough context",
+		"do not have enough context",
+		"need more context to proceed",
+		"need an idea to proceed",
+		"please provide an idea",
+		"give me an idea to work from",
+	].some((phrase) => normalized.includes(phrase));
+}
+
+export default function convoExtension(pi: ExtensionAPI) {
+	let state: ConvoState = {
+		active: false,
+		seed: "",
+		useExistingContext: false,
+		answers: [],
+	};
+
+	function persistState(): void {
+		pi.appendEntry(STATE_ENTRY, { ...state });
+	}
+
+	function updateUI(ctx: ExtensionContext): void {
+		if (!ctx.hasUI) return;
+
+		if (!state.active) {
+			ctx.ui.setStatus(STATUS_ID, undefined);
+			ctx.ui.setWidget(WIDGET_ID, undefined);
+			return;
+		}
+
+		const seed = state.seed.length > 90 ? `${state.seed.slice(0, 87)}...` : state.seed;
+		const hasKnownProgress =
+			typeof state.progressCurrent === "number" &&
+			typeof state.progressTotal === "number" &&
+			state.progressCurrent > 0 &&
+			state.progressTotal > 0;
+		const statusText = hasKnownProgress ? `💬 convo ${state.progressCurrent}/${state.progressTotal}` : "💬 convo";
+		ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("accent", statusText));
+
+		const contextLine = state.useExistingContext ? "Context: current session" : `Idea: ${seed}`;
+		const lines = [
+			ctx.ui.theme.fg(
+				"accent",
+				hasKnownProgress ? `Convo mode active • ${state.progressCurrent}/${state.progressTotal}` : "Convo mode active",
+			),
+			ctx.ui.theme.fg("muted", contextLine),
+			ctx.ui.theme.fg("dim", "Ctrl+C exit • ↑↓ / Ctrl+P Ctrl+N navigate • Tab add context"),
+		];
+		if (state.answers.length > 0) {
+			const latest = state.answers[state.answers.length - 1]!;
+			lines.push(ctx.ui.theme.fg("dim", `Latest: ${latest.selectedLabel}`));
+		}
+		ctx.ui.setWidget(WIDGET_ID, lines);
+	}
+
+	function restoreState(ctx: ExtensionContext): void {
+		state = {
+			active: false,
+			seed: "",
+			useExistingContext: false,
+			answers: [],
+		};
+
+		const entries = ctx.sessionManager.getBranch();
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const entry = entries[i] as {
+				type?: string;
+				customType?: string;
+				data?: Partial<ConvoState>;
+			};
+			if (entry.type !== "custom" || entry.customType !== STATE_ENTRY) continue;
+
+			const restoredAnswers = Array.isArray(entry.data?.answers)
+				? entry.data!.answers!
+						.filter((answer): answer is ConvoAnswer => typeof answer === "object" && answer !== null)
+						.map((answer) => sanitizeAnswer(answer))
+				: [];
+
+			state = {
+				active: entry.data?.active === true,
+				seed: typeof entry.data?.seed === "string" ? entry.data.seed : "",
+				useExistingContext: entry.data?.useExistingContext === true,
+				startedAt: typeof entry.data?.startedAt === "number" ? entry.data.startedAt : undefined,
+				answers: restoredAnswers,
+				progressCurrent:
+					typeof entry.data?.progressCurrent === "number"
+						? Math.max(1, Math.floor(entry.data.progressCurrent))
+						: undefined,
+				progressTotal:
+					typeof entry.data?.progressTotal === "number"
+						? Math.max(1, Math.floor(entry.data.progressTotal))
+						: undefined,
+			};
+			break;
+		}
+
+		updateUI(ctx);
+	}
+
+	function exitConvo(ctx: ExtensionContext, message = "Exited convo mode."): void {
+		if (!state.active) return;
+		state = { ...state, active: false };
+		persistState();
+		updateUI(ctx);
+		ctx.ui.notify(message, "info");
+	}
+
+	function enterConvo(seed: string, ctx: ExtensionContext, options?: { useExistingContext?: boolean }): void {
+		state = {
+			active: true,
+			seed,
+			useExistingContext: options?.useExistingContext === true,
+			startedAt: Date.now(),
+			answers: [],
+			progressCurrent: undefined,
+			progressTotal: undefined,
+		};
+		persistState();
+		updateUI(ctx);
+		ctx.ui.notify("Convo mode active.", "info");
+	}
+
+	function installEditor(ctx: ExtensionContext): void {
+		if (!ctx.hasUI) return;
+		ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+			const editor = new ConvoEditor(tui, theme, keybindings);
+			editor.isConvoActive = () => state.active;
+			editor.onExitConvo = () => exitConvo(ctx);
+			return editor;
+		});
+	}
+
+	pi.registerCommand("convo", {
+		description: "Start a collaborative requirements conversation",
+		handler: async (args, ctx) => {
+			const idea = args.trim();
+			if (!idea && state.active) {
+				ctx.ui.notify(
+					state.useExistingContext ? "Convo mode active: current session context" : `Convo mode active: ${state.seed}`,
+					"info",
+				);
+				return;
+			}
+
+			const usingExistingContext = !idea;
+			if (usingExistingContext && !hasMeaningfulSessionContext(ctx)) {
+				ctx.ui.notify("Not enough existing context yet. Give /convo an idea first.", "warning");
+				return;
+			}
+
+			const seed = usingExistingContext ? SESSION_CONTEXT_SEED : idea;
+			enterConvo(seed, ctx, { useExistingContext: usingExistingContext });
+			const prompt = usingExistingContext
+				? "Let's work this out together before implementation using the existing session context so far. If there isn't enough context to proceed, say so plainly."
+				: `Let's work this out together before implementation.\n\nIdea:\n${idea}`;
+			if (ctx.isIdle()) {
+				pi.sendUserMessage(prompt);
+			} else {
+				pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+				ctx.ui.notify("Queued convo to start after the current work finishes.", "info");
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "convo_questionnaire",
+		label: "Convo Questionnaire",
+		description:
+			"Ask a batch of interactive multiple-choice clarification questions during /convo mode. Use this instead of plain chat questions. The UI asks one question at a time locally, supports extra context via Tab, and avoids LLM round-trips between questions.",
+		promptSnippet: "Ask a local batch of clarification questions during /convo mode.",
+		promptGuidelines: [
+			"During /convo mode, ask clarifying questions with convo_questionnaire instead of plain text.",
+			"Provide a batch of high-value questions so the user can answer locally without waiting between questions.",
+			"For each question, provide three to five concrete options.",
+		],
+		parameters: ConvoQuestionnaireParams,
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const input = params as {
+				questions: Array<{ id?: string; question: string; options: string[] }>;
+				progressCurrent?: number;
+				progressTotal?: number;
+			};
+
+			if (!ctx.hasUI) {
+				return {
+					content: [{ type: "text", text: "Error: convo_questionnaire requires interactive mode." }],
+					details: { cancelled: true, exited: false, answers: state.answers } satisfies ConvoBatchResultDetails,
+				};
+			}
+
+			const batch = Array.isArray(input.questions) ? input.questions : [];
+			if (batch.length === 0) {
+				return {
+					content: [{ type: "text", text: "Error: No questions provided." }],
+					details: { cancelled: true, exited: false, answers: state.answers } satisfies ConvoBatchResultDetails,
+				};
+			}
+
+			const history = state.answers.map((answer) => ({ ...answer, options: [...answer.options] }));
+			const baseProgress = Math.max(1, input.progressCurrent ?? history.length + 1);
+			const totalProgress = Math.max(baseProgress + batch.length - 1, input.progressTotal ?? Math.max(5, baseProgress + batch.length - 1));
+
+			const newPages: ConvoAnswer[] = batch.map((question, index) => {
+				const options = normalizeOptions(question.options);
+				return {
+					id: question.id?.trim() || `convo-${history.length + index + 1}-${Date.now()}-${index}`,
+					question: question.question.trim(),
+					options,
+					selectedIndex: 0,
+					selectedLabel: options[0]!,
+					note: "",
+					progressCurrent: baseProgress + index,
+					progressTotal: totalProgress,
+				};
+			});
+
+			function setActiveBatchProgress(page?: ConvoAnswer): void {
+				state = {
+					...state,
+					progressCurrent: page?.progressCurrent,
+					progressTotal: page?.progressTotal,
+				};
+				updateUI(ctx);
+			}
+
+			setActiveBatchProgress(newPages[0]);
+
+			const result = await ctx.ui.custom<ConvoBatchResultDetails>((tui, theme, _kb, done) => {
+				const pages: ConvoAnswer[] = [...history, ...newPages].map((answer) => ({ ...answer, options: [...answer.options] }));
+				const firstNewIndex = history.length;
+				let pageIndex = firstNewIndex;
+				let optionIndex = clamp(pages[pageIndex]!.selectedIndex, 0, pages[pageIndex]!.options.length - 1);
+				let noteMode = false;
+				let cachedLines: string[] | undefined;
+
+				const editorTheme: EditorTheme = {
+					borderColor: (s) => theme.fg("accent", s),
+					selectList: {
+						selectedPrefix: (s) => theme.fg("accent", s),
+						selectedText: (s) => theme.fg("accent", s),
+						description: (s) => theme.fg("muted", s),
+						scrollInfo: (s) => theme.fg("dim", s),
+						noMatch: (s) => theme.fg("warning", s),
+					},
+				};
+				const editor = new Editor(tui, editorTheme);
+				editor.disableSubmit = true;
+				editor.onChange = (text) => {
+					pages[pageIndex]!.note = text;
+					refresh();
+				};
+
+				function refresh(): void {
+					cachedLines = undefined;
+					tui.requestRender();
+				}
+
+				function currentPage(): ConvoAnswer {
+					return pages[pageIndex]!;
+				}
+
+				function syncEditor(): void {
+					editor.setText(currentPage().note);
+					optionIndex = clamp(currentPage().selectedIndex, 0, currentPage().options.length - 1);
+				}
+
+				function saveSelection(): void {
+					const page = currentPage();
+					page.selectedIndex = optionIndex;
+					page.selectedLabel = page.options[optionIndex]!;
+					page.note = editor.getText();
+				}
+
+				function goToPage(nextIndex: number): void {
+					const next = clamp(nextIndex, 0, pages.length - 1);
+					if (next === pageIndex) return;
+					saveSelection();
+					pageIndex = next;
+					noteMode = false;
+					syncEditor();
+					setActiveBatchProgress(currentPage());
+					refresh();
+				}
+
+				function nextQuestionOrDone(): void {
+					saveSelection();
+					if (pageIndex < pages.length - 1) {
+						pageIndex += 1;
+						noteMode = false;
+						syncEditor();
+						setActiveBatchProgress(currentPage());
+						refresh();
+						return;
+					}
+					done({
+						cancelled: false,
+						exited: false,
+						current: { ...currentPage() },
+						answers: pages.map((page) => ({ ...page })),
+					});
+				}
+
+				syncEditor();
+
+				return {
+					invalidate() {
+						cachedLines = undefined;
+					},
+
+					handleInput(data: string) {
+						if (matchesKey(data, "ctrl+c")) {
+							done({ cancelled: true, exited: true, answers: state.answers });
+							return;
+						}
+
+						if (noteMode) {
+							if (matchesKey(data, "escape")) {
+								saveSelection();
+								noteMode = false;
+								refresh();
+								return;
+							}
+							if (matchesKey(data, "enter")) {
+								nextQuestionOrDone();
+								return;
+							}
+							editor.handleInput(data);
+							currentPage().note = editor.getText();
+							refresh();
+							return;
+						}
+
+						if (matchesKey(data, "left")) {
+							goToPage(pageIndex - 1);
+							return;
+						}
+						if (matchesKey(data, "right")) {
+							goToPage(pageIndex + 1);
+							return;
+						}
+						if (matchesKey(data, "up") || matchesKey(data, "ctrl+p")) {
+							optionIndex = clamp(optionIndex - 1, 0, currentPage().options.length - 1);
+							refresh();
+							return;
+						}
+						if (matchesKey(data, "down") || matchesKey(data, "ctrl+n")) {
+							optionIndex = clamp(optionIndex + 1, 0, currentPage().options.length - 1);
+							refresh();
+							return;
+						}
+						if (matchesKey(data, "tab")) {
+							saveSelection();
+							noteMode = true;
+							syncEditor();
+							refresh();
+							return;
+						}
+						if (matchesKey(data, "enter")) {
+							nextQuestionOrDone();
+						}
+					},
+
+					render(width: number): string[] {
+						if (cachedLines) return cachedLines;
+
+						const page = currentPage();
+						const lines: string[] = [];
+						const add = (line: string) => lines.push(truncateToWidth(line, width));
+
+						add(theme.fg("accent", "─".repeat(width)));
+						add(theme.fg("accent", ` Question ${page.progressCurrent}/${page.progressTotal}`));
+						if (pages.length > 1) {
+							add(theme.fg("dim", ` Review ${pageIndex + 1}/${pages.length} • ← previous • → next`));
+						}
+						lines.push("");
+						add(theme.fg("text", ` ${page.question}`));
+						lines.push("");
+
+						for (let i = 0; i < page.options.length; i++) {
+							const isCursor = i === optionIndex;
+							const isSaved = i === page.selectedIndex;
+							const prefix = isCursor ? theme.fg("accent", "> ") : "  ";
+							const bullet = isSaved ? theme.fg("success", "●") : theme.fg("dim", "○");
+							const text = `${i + 1}. ${page.options[i]}`;
+							add(`${prefix}${bullet} ${isCursor ? theme.fg("accent", text) : theme.fg("text", text)}`);
+						}
+
+						lines.push("");
+						add(noteMode ? theme.fg("accent", " Additional context") : theme.fg("muted", " Additional context (Tab to edit)"));
+						if (noteMode) {
+							for (const line of editor.render(Math.max(10, width - 2))) {
+								add(` ${line}`);
+							}
+						} else if (page.note.trim()) {
+							for (const line of page.note.split("\n")) {
+								add(` ${theme.fg("text", line || " ")}`);
+							}
+						} else {
+							add(theme.fg("dim", "   No extra context"));
+						}
+
+						lines.push("");
+						add(theme.fg("dim", " ↑↓ or Ctrl+P/Ctrl+N choose • Tab context • Enter next • Esc leave note • Ctrl+C exit"));
+						add(theme.fg("accent", "─".repeat(width)));
+
+						cachedLines = lines;
+						return lines;
+					},
+				};
+			});
+
+			if (result.exited) {
+				exitConvo(ctx, "Exited convo mode.");
+				return {
+					content: [{ type: "text", text: "User exited convo mode. Stop asking clarification questions." }],
+					details: result,
+				};
+			}
+
+			const answers = result.answers.map((answer) => sanitizeAnswer(answer));
+			const current = result.current ? sanitizeAnswer(result.current) : answers[answers.length - 1];
+			state = {
+				...state,
+				answers,
+				progressCurrent: undefined,
+				progressTotal: undefined,
+			};
+			persistState();
+			updateUI(ctx);
+
+			return {
+				content: [{ type: "text", text: buildToolContent(answers) }],
+				details: {
+					cancelled: false,
+					exited: false,
+					answers,
+					current,
+				} satisfies ConvoBatchResultDetails,
+			};
+		},
+
+		renderCall(args, theme) {
+			const input = args as {
+				questions?: Array<{ question?: string }>;
+				progressCurrent?: number;
+				progressTotal?: number;
+			};
+			const questions = Array.isArray(input.questions) ? input.questions : [];
+			const hasKnownProgress =
+				typeof input.progressCurrent === "number" &&
+				typeof input.progressTotal === "number" &&
+				input.progressCurrent > 0 &&
+				input.progressTotal > 0;
+			const label = questions.length === 1 ? questions[0]?.question || "Question" : `${questions.length} questions`;
+			return new Text(
+				theme.fg("toolTitle", theme.bold("convo_questionnaire ")) +
+					(hasKnownProgress ? theme.fg("accent", `${input.progressCurrent}/${input.progressTotal} `) : "") +
+					theme.fg("muted", label),
+				0,
+				0,
+			);
+		},
+
+		renderResult(result, _options, theme) {
+			const details = result.details as ConvoBatchResultDetails | undefined;
+			if (!details) return new Text("", 0, 0);
+			if (details.exited) return new Text(theme.fg("warning", "Exited convo mode"), 0, 0);
+			const current = details.current;
+			if (!current) return new Text(theme.fg("warning", "No answers recorded"), 0, 0);
+			let text = theme.fg("success", "✓ ") + theme.fg("accent", current.selectedLabel);
+			if (current.note.trim()) text += `\n${theme.fg("muted", current.note.trim())}`;
+			return new Text(text, 0, 0);
+		},
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		installEditor(ctx);
+		restoreState(ctx);
+	});
+
+	pi.on("session_switch", async (_event, ctx) => {
+		installEditor(ctx);
+		restoreState(ctx);
+	});
+
+	pi.on("session_fork", async (_event, ctx) => {
+		installEditor(ctx);
+		restoreState(ctx);
+	});
+
+	pi.on("input", async (event, ctx) => {
+		if (!state.active || event.source === "extension") return { action: "continue" as const };
+		if (looksLikeImplementationIntent(event.text.trim())) exitConvo(ctx, "Exited convo mode. Moving on from discovery.");
+		return { action: "continue" as const };
+	});
+
+	pi.on("before_agent_start", async (event) => {
+		if (!state.active) return;
+
+		const seedContext = state.useExistingContext
+			? "Use the existing session context so far. If that context is still insufficient, say so plainly instead of guessing."
+			: `Seed idea:\n${state.seed}`;
+
+		return {
+			systemPrompt:
+				event.systemPrompt +
+				`\n\n[CONVO MODE]\nYou are in collaborative requirements-discovery mode.\n\n${seedContext}\n\nRules:\n- Work out the idea with the user before implementation.\n- Ask follow-up questions with the convo_questionnaire tool, not with plain chat text.\n- Use the tool to ask a local batch of high-value questions so the user does not wait on an LLM round-trip between each answer.\n- Each question in the batch should have three to five concrete options.\n- The tool result includes the complete structured answer history; use it instead of re-asking answered questions.\n- Ask as many questions as needed to make the project concrete, but prefer fewer, better batches.\n- Periodically summarize your current understanding in plain language.\n- Do not start coding, editing files, or writing implementation output unless the user clearly wants to move beyond discovery.\n- Once the work is clear enough, stop asking questions and produce a concise summary with: Goal, Requirements, Constraints, Assumptions, Implementation plan, and Open questions.\n- When you reach that point, include the exact line ${COMPLETE_MARKER} at the very end of the response.`,
+		};
+	});
+
+	pi.on("agent_end", async (event, ctx) => {
+		if (!state.active) return;
+		const text = getLastAssistantText(event.messages as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>);
+		if (!text) return;
+
+		if (state.useExistingContext && state.answers.length === 0 && looksInsufficientContext(text)) {
+			exitConvo(ctx, "Not enough context for /convo yet. Give it an idea first.");
+			return;
+		}
+
+		if (!looksComplete(text)) return;
+
+		if (!ctx.hasUI) {
+			exitConvo(ctx, "Convo mode complete.");
+			return;
+		}
+
+		const choice = await ctx.ui.select("Convo complete — what next?", [
+			"Start implementing",
+			"Keep refining",
+			"Cancel",
+		]);
+
+		if (choice === "Start implementing") {
+			exitConvo(ctx, "Exited convo mode. Starting implementation.");
+			pi.sendUserMessage("Start implementing based on the agreed summary and implementation plan.");
+			return;
+		}
+
+		if (choice === "Keep refining") {
+			pi.sendUserMessage("Keep refining this. Ask the next batch of highest-value clarification questions.");
+			return;
+		}
+
+		exitConvo(ctx, "Exited convo mode.");
+	});
+}
