@@ -36,6 +36,8 @@ const WIDGET_ID = "convo-mode";
 const COMPLETE_MARKER = "[CONVO_COMPLETE]";
 const FALLBACK_OPTION = "Not sure, give me more detail";
 const SESSION_CONTEXT_SEED = "Use the existing session context so far.";
+const SUMMARY_HEADINGS = ["goal", "requirements", "constraints", "assumptions", "implementation plan", "open questions"] as const;
+const RESOLVED_OPEN_QUESTIONS = ["none", "n/a", "na", "no open questions", "no unresolved questions", "none at this time"];
 
 const IMPLEMENTATION_INTENT = [
 	/\bgo ahead\b/i,
@@ -189,14 +191,84 @@ function looksLikeImplementationIntent(text: string): boolean {
 	return IMPLEMENTATION_INTENT.some((pattern) => pattern.test(text));
 }
 
-function looksComplete(text: string): boolean {
-	if (text.includes(COMPLETE_MARKER)) return true;
+function escapeRegExp(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
+function parseSummaryHeading(line: string): { heading: (typeof SUMMARY_HEADINGS)[number]; remainder: string } | undefined {
+	let normalized = line.trim();
+	if (!normalized) return undefined;
+
+	normalized = normalized
+		.replace(/^[-*•]\s*/, "")
+		.replace(/^#{1,6}\s*/, "")
+		.replace(/^\d+[.)]\s*/, "")
+		.replace(/\*\*/g, "")
+		.replace(/__/g, "")
+		.trim();
+
+	for (const heading of SUMMARY_HEADINGS) {
+		const pattern = new RegExp(`^${escapeRegExp(heading)}(?:\\s*:)?(?:\\s+(.*))?$`, "i");
+		const match = normalized.match(pattern);
+		if (!match) continue;
+		return {
+			heading,
+			remainder: (match[1] ?? "").trim(),
+		};
+	}
+
+	return undefined;
+}
+
+function getSummarySectionLines(text: string, targetHeading: (typeof SUMMARY_HEADINGS)[number]): string[] {
+	const lines = text.split(/\r?\n/);
+	const sectionLines: string[] = [];
+	let collecting = false;
+
+	for (const line of lines) {
+		const parsed = parseSummaryHeading(line);
+		if (parsed) {
+			if (collecting && parsed.heading !== targetHeading) break;
+			if (parsed.heading === targetHeading) {
+				collecting = true;
+				if (parsed.remainder) sectionLines.push(parsed.remainder);
+				continue;
+			}
+		}
+		if (collecting) sectionLines.push(line);
+	}
+
+	return sectionLines;
+}
+
+function isResolvedOpenQuestionLine(line: string): boolean {
+	const normalized = line
+		.toLowerCase()
+		.replace(/^[\s\-–—*•\d.()]+/, "")
+		.replace(/[.!]+$/, "")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (!normalized) return true;
+	return RESOLVED_OPEN_QUESTIONS.includes(normalized);
+}
+
+function hasUnresolvedOpenQuestions(text: string): boolean {
+	const lines = getSummarySectionLines(text, "open questions")
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0 && line !== COMPLETE_MARKER);
+
+	if (lines.length === 0) return false;
+	return lines.some((line) => !isResolvedOpenQuestionLine(line));
+}
+
+function hasSummaryShape(text: string): boolean {
 	const normalized = text.toLowerCase();
-	if (!normalized.includes("implementation plan")) return false;
+	return normalized.includes("implementation plan") && SUMMARY_HEADINGS.filter((heading) => normalized.includes(heading)).length >= 3;
+}
 
-	const headings = ["goal", "requirements", "constraints", "assumptions", "open questions"];
-	return headings.filter((heading) => normalized.includes(heading)).length >= 3;
+function looksComplete(text: string): boolean {
+	const hasCompletionSignal = text.includes(COMPLETE_MARKER) || hasSummaryShape(text);
+	return hasCompletionSignal && !hasUnresolvedOpenQuestions(text);
 }
 
 function looksInsufficientContext(text: string): boolean {
@@ -403,8 +475,9 @@ export default function convoExtension(pi: ExtensionAPI) {
 			}
 
 			const history = state.answers.map((answer) => ({ ...answer, options: [...answer.options] }));
-			const baseProgress = Math.max(1, input.progressCurrent ?? history.length + 1);
-			const totalProgress = Math.max(baseProgress + batch.length - 1, input.progressTotal ?? Math.max(5, baseProgress + batch.length - 1));
+			const baseProgress = Math.max(1, history.length + 1);
+			const minimumTotalProgress = baseProgress + batch.length - 1;
+			const totalProgress = Math.max(minimumTotalProgress, input.progressTotal ?? Math.max(5, minimumTotalProgress));
 
 			const newPages: ConvoAnswer[] = batch.map((question, index) => {
 				const options = normalizeOptions(question.options);
@@ -420,24 +493,35 @@ export default function convoExtension(pi: ExtensionAPI) {
 				};
 			});
 
-			function setActiveBatchProgress(page?: ConvoAnswer): void {
+			function setActiveBatchProgress(progress?: { current: number; total: number }): void {
 				state = {
 					...state,
-					progressCurrent: page?.progressCurrent,
-					progressTotal: page?.progressTotal,
+					progressCurrent: progress?.current,
+					progressTotal: progress?.total,
 				};
 				updateUI(ctx);
 			}
 
-			setActiveBatchProgress(newPages[0]);
+			setActiveBatchProgress({ current: baseProgress, total: totalProgress });
 
 			const result = await ctx.ui.custom<ConvoBatchResultDetails>((tui, theme, _kb, done) => {
 				const pages: ConvoAnswer[] = [...history, ...newPages].map((answer) => ({ ...answer, options: [...answer.options] }));
 				const firstNewIndex = history.length;
 				let pageIndex = firstNewIndex;
+				let activeProgressPageIndex = firstNewIndex;
 				let optionIndex = clamp(pages[pageIndex]!.selectedIndex, 0, pages[pageIndex]!.options.length - 1);
 				let noteMode = false;
 				let cachedLines: string[] | undefined;
+
+				function getDisplayProgress(): { current: number; total: number; reviewingHistory: boolean } {
+					const reviewingHistory = pageIndex < firstNewIndex;
+					const offset = activeProgressPageIndex - firstNewIndex;
+					return {
+						current: baseProgress + offset,
+						total: totalProgress,
+						reviewingHistory,
+					};
+				}
 
 				const editorTheme: EditorTheme = {
 					borderColor: (s) => theme.fg("accent", s),
@@ -482,9 +566,11 @@ export default function convoExtension(pi: ExtensionAPI) {
 					if (next === pageIndex) return;
 					saveSelection();
 					pageIndex = next;
+					if (pageIndex >= firstNewIndex) activeProgressPageIndex = pageIndex;
 					noteMode = false;
 					syncEditor();
-					setActiveBatchProgress(currentPage());
+					const progress = getDisplayProgress();
+					setActiveBatchProgress({ current: progress.current, total: progress.total });
 					refresh();
 				}
 
@@ -492,9 +578,11 @@ export default function convoExtension(pi: ExtensionAPI) {
 					saveSelection();
 					if (pageIndex < pages.length - 1) {
 						pageIndex += 1;
+						if (pageIndex >= firstNewIndex) activeProgressPageIndex = pageIndex;
 						noteMode = false;
 						syncEditor();
-						setActiveBatchProgress(currentPage());
+						const progress = getDisplayProgress();
+						setActiveBatchProgress({ current: progress.current, total: progress.total });
 						refresh();
 						return;
 					}
@@ -570,13 +658,17 @@ export default function convoExtension(pi: ExtensionAPI) {
 						if (cachedLines) return cachedLines;
 
 						const page = currentPage();
+						const progress = getDisplayProgress();
 						const lines: string[] = [];
 						const add = (line: string) => lines.push(truncateToWidth(line, width));
 
 						add(theme.fg("accent", "─".repeat(width)));
-						add(theme.fg("accent", ` Question ${page.progressCurrent}/${page.progressTotal}`));
+						add(theme.fg("accent", ` Question ${progress.current}/${progress.total}`));
 						if (pages.length > 1) {
-							add(theme.fg("dim", ` Review ${pageIndex + 1}/${pages.length} • ← previous • → next`));
+							const reviewLabel = progress.reviewingHistory
+								? ` Reviewing earlier answer ${pageIndex + 1}/${pages.length} • ← previous • → next`
+								: ` Review ${pageIndex + 1}/${pages.length} • ← previous • → next`;
+							add(theme.fg("dim", reviewLabel));
 						}
 						lines.push("");
 						add(theme.fg("text", ` ${page.question}`));
@@ -652,15 +744,16 @@ export default function convoExtension(pi: ExtensionAPI) {
 				progressTotal?: number;
 			};
 			const questions = Array.isArray(input.questions) ? input.questions : [];
-			const hasKnownProgress =
-				typeof input.progressCurrent === "number" &&
-				typeof input.progressTotal === "number" &&
-				input.progressCurrent > 0 &&
-				input.progressTotal > 0;
+			const progressCurrent = Math.max(1, state.answers.length + 1);
+			const minimumProgressTotal = Math.max(progressCurrent, progressCurrent + Math.max(0, questions.length - 1));
+			const progressTotal =
+				typeof input.progressTotal === "number" && input.progressTotal > 0
+					? Math.max(minimumProgressTotal, input.progressTotal)
+					: undefined;
 			const label = questions.length === 1 ? questions[0]?.question || "Question" : `${questions.length} questions`;
 			return new Text(
 				theme.fg("toolTitle", theme.bold("convo_questionnaire ")) +
-					(hasKnownProgress ? theme.fg("accent", `${input.progressCurrent}/${input.progressTotal} `) : "") +
+					(progressTotal ? theme.fg("accent", `${progressCurrent}/${progressTotal} `) : "") +
 					theme.fg("muted", label),
 				0,
 				0,
@@ -710,7 +803,7 @@ export default function convoExtension(pi: ExtensionAPI) {
 		return {
 			systemPrompt:
 				event.systemPrompt +
-				`\n\n[CONVO MODE]\nYou are in collaborative requirements-discovery mode.\n\n${seedContext}\n\nRules:\n- Work out the idea with the user before implementation.\n- Ask follow-up questions with the convo_questionnaire tool, not with plain chat text.\n- Use the tool to ask a local batch of high-value questions so the user does not wait on an LLM round-trip between each answer.\n- Each question in the batch should have three to five concrete options.\n- The tool result includes the complete structured answer history; use it instead of re-asking answered questions.\n- Ask as many questions as needed to make the project concrete, but prefer fewer, better batches.\n- Periodically summarize your current understanding in plain language.\n- Do not start coding, editing files, or writing implementation output unless the user clearly wants to move beyond discovery.\n- Once the work is clear enough, stop asking questions and produce a concise summary with: Goal, Requirements, Constraints, Assumptions, Implementation plan, and Open questions.\n- When you reach that point, include the exact line ${COMPLETE_MARKER} at the very end of the response.`,
+				`\n\n[CONVO MODE]\nYou are in collaborative requirements-discovery mode.\n\n${seedContext}\n\nRules:\n- Work out the idea with the user before implementation.\n- Ask follow-up questions with the convo_questionnaire tool, not with plain chat text.\n- Use the tool to ask a local batch of high-value questions so the user does not wait on an LLM round-trip between each answer.\n- Each question in the batch should have three to five concrete options.\n- The tool result includes the complete structured answer history; use it instead of re-asking answered questions.\n- Ask as many questions as needed to make the project concrete, but prefer fewer, better batches.\n- Periodically summarize your current understanding in plain language.\n- Do not start coding, editing files, or writing implementation output unless the user clearly wants to move beyond discovery.\n- Once the work is clear enough, stop asking questions and produce a concise summary with: Goal, Requirements, Constraints, Assumptions, Implementation plan, and Open questions.\n- Do not finish with unresolved items under Open questions. Either resolve them via reasonable assumptions and document those assumptions, or ask another batch of clarification questions.\n- Only mark the convo complete when Open questions is explicitly None, N/A, or no open questions.\n- When you reach that point, include the exact line ${COMPLETE_MARKER} at the very end of the response.`,
 		};
 	});
 
@@ -721,6 +814,15 @@ export default function convoExtension(pi: ExtensionAPI) {
 
 		if (state.useExistingContext && state.answers.length === 0 && looksInsufficientContext(text)) {
 			exitConvo(ctx, "Not enough context for /convo yet. Give it an idea first.");
+			return;
+		}
+
+		if (hasSummaryShape(text) && hasUnresolvedOpenQuestions(text)) {
+			if (ctx.hasUI) ctx.ui.notify("Convo summary still has open questions. Continuing refinement.", "info");
+			pi.sendUserMessage(
+				"Your last summary still listed unresolved open questions. Convo is not complete until Open questions is None. Ask the next batch of highest-value clarification questions, or resolve the gaps with reasonable assumptions and update the summary.",
+				{ deliverAs: "followUp" },
+			);
 			return;
 		}
 
