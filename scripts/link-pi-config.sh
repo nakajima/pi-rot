@@ -43,9 +43,20 @@ if [[ -e "$DST_MEMORIES" && ! -L "$DST_MEMORIES" ]]; then
   exit 1
 fi
 
-ln -sfn "$SRC_KEYBINDINGS" "$DST_KEYBINDINGS"
-ln -sfnT "$SRC_EXTENSIONS" "$DST_EXTENSIONS"
-ln -sfn "$SRC_MEMORIES" "$DST_MEMORIES"
+link_path() {
+  local src="$1"
+  local dst="$2"
+
+  if [[ -L "$dst" ]]; then
+    rm -f "$dst"
+  fi
+
+  ln -s "$src" "$dst"
+}
+
+link_path "$SRC_KEYBINDINGS" "$DST_KEYBINDINGS"
+link_path "$SRC_EXTENSIONS" "$DST_EXTENSIONS"
+link_path "$SRC_MEMORIES" "$DST_MEMORIES"
 
 echo "Linked $DST_KEYBINDINGS -> $SRC_KEYBINDINGS"
 echo "Linked $DST_EXTENSIONS -> $SRC_EXTENSIONS"
