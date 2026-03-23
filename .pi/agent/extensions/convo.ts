@@ -119,6 +119,24 @@ const IMPLEMENTATION_INTENT = [
 	/\blet'?s do it\b/i,
 	/^(can|could|would|will)\s+you\s+.*\b(implement|build|code|write)\b/i,
 ];
+const CLARIFICATION_REQUEST_PHRASES = [
+	"need more information",
+	"need more info",
+	"need more context",
+	"need more details",
+	"need a few more details",
+	"need clarification",
+	"need some clarification",
+	"can you clarify",
+	"could you clarify",
+	"please clarify",
+	"i have a few questions",
+	"i have some questions",
+	"ask a few questions",
+	"ask some questions",
+	"before i proceed",
+	"before proceeding",
+];
 
 const ConvoQuestionSchema = Type.Object({
 	id: Type.Optional(Type.String({ description: "Stable identifier for this question within the batch." })),
