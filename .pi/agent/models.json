@@ -1,0 +1,31 @@
+{
+  "providers": {
+    "llamacpp": {
+      "baseUrl": "http://llamacpp:4000",
+      "api": "openai-completions",
+      "apiKey": "llama.cpp",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "supportsUsageInStreaming": false,
+        "maxTokensField": "max_tokens"
+      },
+      "models": [
+        {
+          "id": "default",
+          "name": "llama.cpp",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 128000,
+          "maxTokens": 16384,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        }
+      ]
+    }
+  }
+}
