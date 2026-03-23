@@ -801,6 +801,18 @@ function looksLikeClarificationRequest(text: string): boolean {
 	return CLARIFICATION_REQUEST_PHRASES.some((phrase) => normalized.includes(phrase)) || text.includes("?");
 }
 
+function countQuestionMarks(text: string): number {
+	return (text.match(/\?/g) ?? []).length;
+}
+
+function shouldAutoEnterConvo(text: string): boolean {
+	const normalized = text.toLowerCase();
+	if (CLARIFICATION_REQUEST_PHRASES.some((phrase) => normalized.includes(phrase))) return true;
+	if (looksInsufficientContext(text)) return true;
+	if (/\b(what|which|where|when|why|how|should)\b.+\?/i.test(text) && countQuestionMarks(text) >= 2) return true;
+	return false;
+}
+
 export default function convoExtension(pi: ExtensionAPI) {
 	let state: ConvoState = {
 		active: false,
@@ -951,6 +963,15 @@ export default function convoExtension(pi: ExtensionAPI) {
 		persistState();
 		updateUI(ctx);
 		ctx.ui.notify("Convo mode active.", "info");
+	}
+
+	async function autoEnterConvoFromContext(ctx: ExtensionContext, options?: { reason?: string }): Promise<boolean> {
+		if (state.active || !hasMeaningfulSessionContext(ctx)) return false;
+		const seed = deriveSessionSeed(ctx);
+		const preflight = await buildConvoPreflight(seed, ctx, { useExistingContext: true });
+		enterConvo(seed, ctx, { useExistingContext: true, preflight });
+		if (ctx.hasUI) ctx.ui.notify(options?.reason || "Pi needs a few answers before it can proceed. Switched to convo mode.", "info");
+		return true;
 	}
 
 	function installEditor(ctx: ExtensionContext): void {
@@ -1397,9 +1418,21 @@ export default function convoExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
-		if (!state.active) return;
 		const text = getLastAssistantText(event.messages as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>);
 		if (!text) return;
+
+		if (!state.active) {
+			if (!ctx.hasUI || !shouldAutoEnterConvo(text)) return;
+			const entered = await autoEnterConvoFromContext(ctx, {
+				reason: "Pi has follow-up questions. Switched to convo mode automatically.",
+			});
+			if (!entered) return;
+			pi.sendUserMessage(
+				"You need more information before you can continue. You are now in convo mode. Do not ask plain chat questions. Call convo_questionnaire with the next batch of highest-value clarification questions.",
+				{ deliverAs: "followUp" },
+			);
+			return;
+		}
 
 		if (state.useExistingContext && state.answers.length === 0 && looksInsufficientContext(text)) {
 			exitConvo(ctx, "Not enough context for /convo yet. Give it an idea first.");

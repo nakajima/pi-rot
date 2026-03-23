@@ -10,6 +10,8 @@ SRC_EXTENSIONS="$REPO_DIR/.pi/agent/extensions"
 DST_EXTENSIONS="$HOME/.pi/agent/extensions"
 SRC_MEMORIES="$REPO_DIR/.pi/agent/memories.md"
 DST_MEMORIES="$HOME/.pi/agent/memories.md"
+SRC_MODELS="$REPO_DIR/.pi/agent/models.json"
+DST_MODELS="$HOME/.pi/agent/models.json"
 
 if [[ ! -f "$SRC_KEYBINDINGS" ]]; then
   echo "Source keybindings not found: $SRC_KEYBINDINGS" >&2
@@ -23,6 +25,11 @@ fi
 
 if [[ ! -f "$SRC_MEMORIES" ]]; then
   echo "Source memories file not found: $SRC_MEMORIES" >&2
+  exit 1
+fi
+
+if [[ ! -f "$SRC_MODELS" ]]; then
+  echo "Source models file not found: $SRC_MODELS" >&2
   exit 1
 fi
 
@@ -43,6 +50,11 @@ if [[ -e "$DST_MEMORIES" && ! -L "$DST_MEMORIES" ]]; then
   exit 1
 fi
 
+if [[ -e "$DST_MODELS" && ! -L "$DST_MODELS" ]]; then
+  echo "Refusing to replace non-symlink file: $DST_MODELS" >&2
+  exit 1
+fi
+
 link_path() {
   local src="$1"
   local dst="$2"
@@ -57,8 +69,10 @@ link_path() {
 link_path "$SRC_KEYBINDINGS" "$DST_KEYBINDINGS"
 link_path "$SRC_EXTENSIONS" "$DST_EXTENSIONS"
 link_path "$SRC_MEMORIES" "$DST_MEMORIES"
+link_path "$SRC_MODELS" "$DST_MODELS"
 
 echo "Linked $DST_KEYBINDINGS -> $SRC_KEYBINDINGS"
 echo "Linked $DST_EXTENSIONS -> $SRC_EXTENSIONS"
 echo "Linked $DST_MEMORIES -> $SRC_MEMORIES"
+echo "Linked $DST_MODELS -> $SRC_MODELS"
 echo "In an active pi session, run: /reload"
