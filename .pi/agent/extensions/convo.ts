@@ -120,25 +120,6 @@ const IMPLEMENTATION_INTENT = [
 	/^(can|could|would|will)\s+you\s+.*\b(implement|build|code|write)\b/i,
 ];
 
-const CLARIFICATION_REQUEST_PHRASES = [
-	"i need a few more details",
-	"i need a few more specifics",
-	"i need more details",
-	"i need more information",
-	"i need a bit more information",
-	"i need a little more information",
-	"i need a few more pieces of information",
-	"i have a few questions",
-	"i have a couple of questions",
-	"a few quick questions",
-	"a couple of quick questions",
-	"before i can proceed",
-	"before i can implement",
-	"to make the project concrete",
-	"to make this project concrete",
-	"to make this concrete",
-] as const;
-
 const ConvoQuestionSchema = Type.Object({
 	id: Type.Optional(Type.String({ description: "Stable identifier for this question within the batch." })),
 	question: Type.String({ description: "The clarification question to ask the user." }),
@@ -271,9 +252,11 @@ function isInternalConvoMessage(text: string): boolean {
 		/^\/convo(?:\s+|$)/i,
 		/^let'?s work this out together before implementation/i,
 		/^keep refining this\.?/i,
+		/^keep planning this\.?/i,
 		/^start implementing based on the agreed summary and implementation plan\.?/i,
 		/^your last summary still listed unresolved open questions/i,
 		/^you still need more information\.?/i,
+		/^you are still in \/?convo discovery mode\.?/i,
 	].some((pattern) => pattern.test(normalized));
 }
 
@@ -945,7 +928,7 @@ export default function convoExtension(pi: ExtensionAPI) {
 		state = { ...state, active: false, questionnaireRetryCount: 0 };
 		persistState();
 		updateUI(ctx);
-		ctx.ui.notify(message, "info");
+		if (ctx.hasUI) ctx.ui.notify(message, "info");
 	}
 
 	function enterConvo(seed: string, ctx: ExtensionContext, options?: { useExistingContext?: boolean; preflight?: ConvoPreflight }): void {
@@ -962,7 +945,44 @@ export default function convoExtension(pi: ExtensionAPI) {
 		};
 		persistState();
 		updateUI(ctx);
-		ctx.ui.notify("Convo mode active.", "info");
+		if (ctx.hasUI) ctx.ui.notify("Convo mode active.", "info");
+	}
+
+	async function promptForNextConvoStep(ctx: ExtensionContext, mode: "complete" | "incomplete"): Promise<void> {
+		if (!ctx.hasUI) {
+			if (mode === "complete") {
+				exitConvo(ctx, "Convo mode complete.");
+				return;
+			}
+			pi.sendUserMessage(
+				"You are still in /convo discovery mode. Do not stop without a next step. Either call convo_questionnaire with the next batch of highest-value clarification questions, or if the work is already clear enough, produce the final summary with Goal, Requirements, Constraints, Assumptions, Implementation plan, and Open questions: None, ending with [CONVO_COMPLETE].",
+				{ deliverAs: "followUp" },
+			);
+			return;
+		}
+
+		const choice = await ctx.ui.select(
+			mode === "complete" ? "Convo complete — what next?" : "Convo needs a next step — what next?",
+			mode === "complete" ? ["Start implementing", "Keep Planning", "Cancel"] : ["Keep Planning", "Start implementing", "Cancel"],
+		);
+
+		if (choice === "Start implementing") {
+			exitConvo(ctx, "Exited convo mode. Starting implementation.");
+			pi.sendUserMessage("Start implementing based on the agreed summary and implementation plan.");
+			return;
+		}
+
+		if (choice === "Keep Planning") {
+			pi.sendUserMessage(
+				mode === "complete"
+					? "Keep planning this. Stay in convo mode. Either ask the next batch of highest-value clarification questions using convo_questionnaire, or revise the plan if more refinement is needed."
+					: "You are still in /convo discovery mode. Do not stop without a next step. Either call convo_questionnaire with the next batch of highest-value clarification questions, or if the work is already clear enough, produce the final summary with Goal, Requirements, Constraints, Assumptions, Implementation plan, and Open questions: None, ending with [CONVO_COMPLETE].",
+				{ deliverAs: "followUp" },
+			);
+			return;
+		}
+
+		exitConvo(ctx, "Exited convo mode.");
 	}
 
 	async function autoEnterConvoFromContext(ctx: ExtensionContext, options?: { reason?: string }): Promise<boolean> {
@@ -1413,13 +1433,16 @@ export default function convoExtension(pi: ExtensionAPI) {
 		return {
 			systemPrompt:
 				event.systemPrompt +
-				`\n\n[CONVO MODE]\nYou are in collaborative requirements-discovery mode.\n\n${seedContext}${preflightContext}\n\nRules:\n- Work out the idea with the user before implementation.\n- Use the preflight context above before asking questions. Do not ignore it and do not begin with generic discovery questions when the preflight already narrows the task.\n- Ask follow-up questions with the convo_questionnaire tool, not with plain chat text.\n- Use the tool to ask a local batch of high-value questions so the user does not wait on an LLM round-trip between each answer.\n- Each question in the batch should have three to five concrete options.\n- The tool result includes the complete structured answer history; use it instead of re-asking answered questions.\n- Ask as many questions as needed to make the project concrete, but prefer fewer, better batches.\n- Prefer the top 1-2 highest-value missing questions over a long generic list.\n- If you present likely directions, make them adaptive to the request and include a clear 'None of these / something else' escape hatch.\n- Recommended opening move for this convo: ${recommendedOpen}\n- If confidence is high and the request is explicit with strong repo evidence, you may skip questions and move straight to a concrete summary/plan.\n- Periodically summarize your current understanding in plain language.\n- Do not start coding, editing files, or writing implementation output unless the user clearly wants to move beyond discovery.\n- Once the work is clear enough, stop asking questions and produce a concise summary with: Goal, Requirements, Constraints, Assumptions, Implementation plan, and Open questions.\n- Do not finish with unresolved items under Open questions. Either resolve them via reasonable assumptions and document those assumptions, or ask another batch of clarification questions.\n- Only mark the convo complete when Open questions is explicitly None, N/A, or no open questions.\n- When you reach that point, include the exact line ${COMPLETE_MARKER} at the very end of the response.`,
+				`\n\n[CONVO MODE]\nYou are in collaborative requirements-discovery mode.\n\n${seedContext}${preflightContext}\n\nRules:\n- Work out the idea with the user before implementation.\n- Use the preflight context above before asking questions. Do not ignore it and do not begin with generic discovery questions when the preflight already narrows the task.\n- Ask follow-up questions with the convo_questionnaire tool, not with plain chat text.\n- If you still need clarification after sharing repo findings or an interim summary, do not stop there. Immediately either call convo_questionnaire with the next batch or produce the final summary if the work is already clear enough.\n- Use the tool to ask a local batch of high-value questions so the user does not wait on an LLM round-trip between each answer.\n- Each question in the batch should have three to five concrete options.\n- The tool result includes the complete structured answer history; use it instead of re-asking answered questions.\n- Ask as many questions as needed to make the project concrete, but prefer fewer, better batches.\n- Prefer the top 1-2 highest-value missing questions over a long generic list.\n- If you present likely directions, make them adaptive to the request and include a clear 'None of these / something else' escape hatch.\n- Recommended opening move for this convo: ${recommendedOpen}\n- If confidence is high and the request is explicit with strong repo evidence, you may skip questions and move straight to a concrete summary/plan.\n- Periodically summarize your current understanding in plain language.\n- Do not start coding, editing files, or writing implementation output unless the user clearly wants to move beyond discovery.\n- Once the work is clear enough, stop asking questions and produce a concise summary with: Goal, Requirements, Constraints, Assumptions, Implementation plan, and Open questions.\n- Do not finish with unresolved items under Open questions. Either resolve them via reasonable assumptions and document those assumptions, or ask another batch of clarification questions.\n- Only mark the convo complete when Open questions is explicitly None, N/A, or no open questions.\n- When you reach that point, include the exact line ${COMPLETE_MARKER} at the very end of the response.`,
 		};
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
 		const text = getLastAssistantText(event.messages as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>);
-		if (!text) return;
+		if (!text) {
+			if (state.active) await promptForNextConvoStep(ctx, "incomplete");
+			return;
+		}
 
 		if (!state.active) {
 			if (!ctx.hasUI || !shouldAutoEnterConvo(text)) return;
@@ -1478,29 +1501,6 @@ export default function convoExtension(pi: ExtensionAPI) {
 		}
 
 		if (!looksComplete(text)) return;
-
-		if (!ctx.hasUI) {
-			exitConvo(ctx, "Convo mode complete.");
-			return;
-		}
-
-		const choice = await ctx.ui.select("Convo complete — what next?", [
-			"Start implementing",
-			"Keep refining",
-			"Cancel",
-		]);
-
-		if (choice === "Start implementing") {
-			exitConvo(ctx, "Exited convo mode. Starting implementation.");
-			pi.sendUserMessage("Start implementing based on the agreed summary and implementation plan.");
-			return;
-		}
-
-		if (choice === "Keep refining") {
-			pi.sendUserMessage("Keep refining this. Ask the next batch of highest-value clarification questions using convo_questionnaire.");
-			return;
-		}
-
-		exitConvo(ctx, "Exited convo mode.");
+		await promptForNextConvoStep(ctx, "complete");
 	});
 }
