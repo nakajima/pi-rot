@@ -1,6 +1,5 @@
 import { mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
-import { complete } from "@mariozechner/pi-ai";
+import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 interface ActiveSessionRecord {
@@ -20,34 +19,180 @@ interface ActiveSessionRecord {
 	workSummaryUpdatedAt?: string;
 }
 
-interface SessionDigest {
-	initialRequest?: string;
-	latestRequest?: string;
-	latestSubstantiveRequest?: string;
-	recentAssistantUpdates: string[];
-	touchedFiles: string[];
-	recentActions: string[];
+interface StoredWorkTitleState {
+	title: string;
+	topicKey: string;
+	updatedAt: string;
 }
 
+interface BaseWorkTitle {
+	title: string;
+	topicKey: string;
+	tokens: string[];
+	source: "sessionName" | "request" | "stored";
+	updatedAt?: string;
+}
+
+interface RequestWorkTitle extends BaseWorkTitle {
+	source: "request";
+	kind: "task" | "inquiry";
+}
+
+type DerivedWorkTitle = BaseWorkTitle | RequestWorkTitle;
+
 type SessionEntry = ReturnType<ExtensionContext["sessionManager"]["getEntries"]>[number];
+
+type SessionBranchEntry = SessionEntry & {
+	type: string;
+	customType?: string;
+	data?: unknown;
+	message?: {
+		role?: string;
+		content?: unknown;
+	};
+};
 
 type MessageContentPart = {
 	type?: string;
 	text?: string;
-	name?: string;
-	arguments?: Record<string, unknown>;
 };
 
 const REGISTRY_DIR = join(getAgentDir(), "runtime", "instances");
+const STATE_ENTRY = "active-session-registry-work-title-v2";
 const HEARTBEAT_MS = 15_000;
 const STALE_GRACE_MS = 5 * 60_000;
-const SUMMARY_MAX_LENGTH = 120;
-const DIGEST_MAX_USER_CHARS = 220;
-const DIGEST_MAX_ASSISTANT_CHARS = 220;
-const DIGEST_RECENT_MESSAGE_WINDOW = 40;
-const DIGEST_MAX_ASSISTANT_UPDATES = 3;
-const DIGEST_MAX_TOUCHED_FILES = 6;
-const DIGEST_MAX_ACTIONS = 4;
+const REQUEST_MAX_CHARS = 220;
+const TITLE_MAX_CHARS = 88;
+const SAME_TOPIC_OVERLAP = 0.3;
+
+const STOP_WORDS = new Set([
+	"a",
+	"an",
+	"and",
+	"another",
+	"are",
+	"as",
+	"at",
+	"be",
+	"been",
+	"being",
+	"but",
+	"by",
+	"can",
+	"codebase",
+	"could",
+	"did",
+	"do",
+	"does",
+	"done",
+	"for",
+	"from",
+	"had",
+	"has",
+	"have",
+	"how",
+	"i",
+	"if",
+	"in",
+	"into",
+	"is",
+	"it",
+	"its",
+	"just",
+	"lets",
+	"let",
+	"maybe",
+	"me",
+	"more",
+	"my",
+	"now",
+	"of",
+	"ok",
+	"okay",
+	"on",
+	"or",
+	"our",
+	"out",
+	"please",
+	"pls",
+	"really",
+	"repo",
+	"same",
+	"should",
+	"so",
+	"some",
+	"something",
+	"still",
+	"sure",
+	"that",
+	"the",
+	"their",
+	"them",
+	"then",
+	"there",
+	"these",
+	"they",
+	"thing",
+	"this",
+	"those",
+	"to",
+	"up",
+	"us",
+	"use",
+	"very",
+	"want",
+	"was",
+	"we",
+	"were",
+	"what",
+	"when",
+	"where",
+	"which",
+	"who",
+	"why",
+	"with",
+	"without",
+	"would",
+	"you",
+	"your",
+]);
+
+const ACTION_WORDS = new Set([
+	"add",
+	"build",
+	"change",
+	"check",
+	"clean",
+	"commit",
+	"continue",
+	"create",
+	"debug",
+	"do",
+	"edit",
+	"explain",
+	"explore",
+	"fix",
+	"implement",
+	"investigate",
+	"make",
+	"pull",
+	"push",
+	"refactor",
+	"reload",
+	"remove",
+	"rename",
+	"review",
+	"rewrite",
+	"ship",
+	"summarize",
+	"sync",
+	"test",
+	"trace",
+	"understand",
+	"update",
+	"work",
+	"write",
+]);
 
 function detectMode(argv: string[]): ActiveSessionRecord["mode"] {
 	for (let i = 0; i < argv.length; i++) {
@@ -74,48 +219,19 @@ function isProcessAlive(pid: number): boolean {
 }
 
 function extractTextParts(content: unknown): string[] {
-	if (typeof content === "string") {
-		return [content];
-	}
+	if (typeof content === "string") return [content];
+	if (!Array.isArray(content)) return [];
 
-	if (!Array.isArray(content)) {
-		return [];
-	}
-
-	const textParts: string[] = [];
+	const parts: string[] = [];
 	for (const part of content) {
 		if (!part || typeof part !== "object") continue;
 		const block = part as MessageContentPart;
 		if (block.type === "text" && typeof block.text === "string") {
 			const text = block.text.trim();
-			if (text) textParts.push(text);
+			if (text) parts.push(text);
 		}
 	}
-	return textParts;
-}
-
-function extractToolCalls(content: unknown): Array<{ name: string; arguments: Record<string, unknown> }> {
-	if (!Array.isArray(content)) {
-		return [];
-	}
-
-	const toolCalls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
-	for (const part of content) {
-		if (!part || typeof part !== "object") continue;
-		const block = part as MessageContentPart;
-		if (block.type !== "toolCall" || typeof block.name !== "string") continue;
-		toolCalls.push({ name: block.name, arguments: block.arguments ?? {} });
-	}
-	return toolCalls;
-}
-
-function truncateSummary(text: string, maxLength = SUMMARY_MAX_LENGTH): string {
-	if (text.length <= maxLength) return text;
-	return `${text.slice(0, maxLength - 1).trimEnd()}…`;
-}
-
-function sanitizeInline(text: string): string {
-	return text.replace(/\s+/g, " ").replace(/^['"“”‘’]+|['"“”‘’]+$/g, "").trim();
+	return parts;
 }
 
 function stripMarkdownArtifacts(text: string): string {
@@ -128,270 +244,263 @@ function stripMarkdownArtifacts(text: string): string {
 		.replace(/^>\s+/gm, "");
 }
 
+function sanitizeInline(text: string): string {
+	return text.replace(/\s+/g, " ").replace(/^['"“”‘’]+|['"“”‘’]+$/g, "").trim();
+}
+
+function truncate(text: string, maxLength: number): string {
+	if (text.length <= maxLength) return text;
+	return `${text.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
 function normalizeSnippet(text: string, maxLength: number): string {
 	const normalized = sanitizeInline(stripMarkdownArtifacts(text));
 	if (!normalized) return "";
-	return truncateSummary(normalized, maxLength);
+	return truncate(normalized, maxLength);
 }
 
-function pushUnique(items: string[], seen: Set<string>, value: string | undefined, maxItems: number): void {
-	if (!value) return;
-	if (seen.has(value)) return;
-	items.push(value);
-	seen.add(value);
-	if (items.length > maxItems) {
-		const removed = items.shift();
-		if (removed) seen.delete(removed);
-	}
+function firstSentence(text: string): string {
+	const match = text.match(/^(.+?)(?:[.?!](?:\s|$)|$)/);
+	return match ? match[1].trim() : text.trim();
 }
 
-function toProjectRelativePath(cwd: string, rawPath: string): string | undefined {
-	const cleaned = rawPath.replace(/^@/, "").trim();
-	if (!cleaned) return undefined;
-
-	const absolute = cleaned.startsWith("/") ? resolve(cleaned) : resolve(cwd, cleaned);
-	const rel = relative(cwd, absolute);
-	if (!rel || rel === ".") return undefined;
-	if (rel === ".." || rel.startsWith("../") || rel.startsWith("..\\")) return undefined;
-
-	const parts = rel.split(/[\\/]+/).filter(Boolean);
-	if (parts.length <= 2) return parts.join("/");
-	return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
+function capitalizeFirst(text: string): string {
+	if (!text) return text;
+	return text[0].toUpperCase() + text.slice(1);
 }
 
-function extractTouchedFiles(
-	ctx: ExtensionContext,
-	toolName: string,
-	args: Record<string, unknown>,
-): string[] {
-	if (toolName !== "read" && toolName !== "edit" && toolName !== "write") {
-		return [];
-	}
-
-	const pathArg =
-		typeof args.path === "string"
-			? args.path
-			: typeof args.file_path === "string"
-				? args.file_path
-				: undefined;
-	if (!pathArg) return [];
-
-	const projectPath = toProjectRelativePath(ctx.cwd, pathArg);
-	return projectPath ? [projectPath] : [];
-}
-
-function inferActionLabel(toolName: string, args: Record<string, unknown>, touchedFiles: string[]): string | undefined {
-	if (toolName === "edit") return touchedFiles.length > 0 ? "edited project files" : undefined;
-	if (toolName === "write") return touchedFiles.length > 0 ? "wrote project files" : undefined;
-	if (toolName === "read") return touchedFiles.length > 0 ? "read project files" : undefined;
-	if (toolName !== "bash") return undefined;
-
-	const command = typeof args.command === "string" ? args.command : "";
-	if (!command) return undefined;
-	if (/\bgit\s+(log|show|diff|status)\b/.test(command)) return "checked git history";
-	if (/\b(?:rg|grep)\b/.test(command)) return "searched the repo";
-	if (/\b(?:ls|find|fd|pwd)\b/.test(command)) return "inspected the repo layout";
-	if (/\brm\b/.test(command)) return "cleaned up files";
-	return "ran shell commands";
+function stripLeadingPreamble(text: string): string {
+	return text
+		.replace(/^(?:ok(?:ay)?|please|pls|hey|well|so|alright|all right)\s+/i, "")
+		.replace(/^(?:can|could|would)\s+you\s+(?:please\s+)?/i, "")
+		.replace(/^(?:can|could|would)\s+we\s+(?:please\s+)?/i, "")
+		.replace(/^(?:let'?s|lets)\s+/i, "")
+		.trim();
 }
 
 function isProceduralRequest(text: string): boolean {
-	return /^(?:ok(?:ay)?|thanks?|thank you|looks good|sounds good|go ahead|continue|proceed|reload|commit(?: and push)?|push)(?:[.! ]+.*)?$/i.test(
+	return /^(?:ok(?:ay)?|yes|yeah|yep|sure|thanks?|thank you|looks good|sounds good|go ahead|continue|proceed|reload|commit(?: and push)?|push|start implementing based on the agreed summary and implementation plan|you need more information before you can continue)(?:[.! ]+.*)?$/i.test(
 		text,
 	);
 }
 
-function isGenericFollowupRequest(text: string): boolean {
-	return /^(?:clean it up|fix it|rename it|update it|do it|do that|same thing|make it better)(?:[.! ]+.*)?$/i.test(
-		text,
+function isReferentialFollowup(text: string): boolean {
+	const normalized = stripLeadingPreamble(text).toLowerCase();
+	return /^(?:clean(?: up)?|fix|rename|update|implement|review|refactor|rewrite|remove|make|do|check|take)\s+(?:it|that|this|them)\b/.test(
+		normalized,
 	);
 }
 
-function normalizeSummaryCandidate(text: string): string {
-	let normalized = normalizeSnippet(text, SUMMARY_MAX_LENGTH);
-	normalized = normalized.replace(/^(?:summary|title|work summary|navigation title)\s*:\s*/i, "");
-	normalized = normalized.replace(/[\s.?!:;,]+$/g, "").trim();
-	return normalized;
+function stemToken(token: string): string {
+	if (token.endsWith("ies") && token.length > 4) return `${token.slice(0, -3)}y`;
+	if (token.endsWith("ing") && token.length > 5) return token.slice(0, -3);
+	if (token.endsWith("s") && token.length > 3 && !token.endsWith("ss")) return token.slice(0, -1);
+	return token;
 }
 
-function isValidSummaryCandidate(text: string): boolean {
-	const normalized = normalizeSummaryCandidate(text);
-	if (!normalized || normalized.length < 8) return false;
-	if (/[\n\r{}\[\]<>"`]/.test(normalized)) return false;
-	if (/^(?:user|assistant|tool result|tool call)\b/i.test(normalized)) return false;
-	if (/^(?:using tools for|tool call|tool result)\b/i.test(normalized)) return false;
-	if (/\/Users\/|runtime\/instances|agent\/sessions|\.jsonl\b/i.test(normalized)) return false;
+function extractTopicTokens(text: string): string[] {
+	const normalized = text.toLowerCase().replace(/[`'"“”‘’]/g, " ").replace(/[\/_.-]+/g, " ");
+	const rawTokens = normalized.match(/[a-z0-9]+/g) ?? [];
+	const tokens: string[] = [];
+	const seen = new Set<string>();
 
-	const words = normalized.split(/\s+/).filter(Boolean);
-	if (words.length < 2) return false;
-	if (/^[A-Za-z0-9._/-]+$/.test(normalized)) return false;
-	if (/^(?:now|next|done|finished)\b\.?$/i.test(normalized)) return false;
-
-	return true;
-}
-
-function buildSessionDigest(ctx: ExtensionContext): SessionDigest {
-	const branch = ctx.sessionManager.getBranch().filter((entry) => entry.type === "message");
-	let initialRequest: string | undefined;
-	let latestRequest: string | undefined;
-	let latestSubstantiveRequest: string | undefined;
-
-	for (const entry of branch) {
-		if (entry.message.role !== "user") continue;
-		const text = normalizeSnippet(extractTextParts(entry.message.content).join("\n"), DIGEST_MAX_USER_CHARS);
-		if (!text) continue;
-		if (!initialRequest) initialRequest = text;
-		latestRequest = text;
-		if (!isProceduralRequest(text)) {
-			latestSubstantiveRequest = text;
-		}
+	for (const raw of rawTokens) {
+		const token = stemToken(raw);
+		if (token.length < 2) continue;
+		if (STOP_WORDS.has(token)) continue;
+		if (ACTION_WORDS.has(token)) continue;
+		if (seen.has(token)) continue;
+		tokens.push(token);
+		seen.add(token);
 	}
 
-	const recentMessages = branch.slice(-DIGEST_RECENT_MESSAGE_WINDOW);
-	const recentAssistantUpdates: string[] = [];
-	const recentAssistantUpdatesSeen = new Set<string>();
-	const touchedFiles: string[] = [];
-	const touchedFilesSeen = new Set<string>();
-	const recentActions: string[] = [];
-	const recentActionsSeen = new Set<string>();
+	return tokens;
+}
 
-	for (const entry of recentMessages) {
-		if (entry.message.role !== "assistant") continue;
+function hasStrongTopicSignal(text: string, tokens: string[]): boolean {
+	if (tokens.length >= 2) return true;
+	if (/[A-Za-z0-9_.-]+\.[A-Za-z0-9]+/.test(text)) return true;
+	if (/\/[A-Za-z0-9._-]+/.test(text)) return true;
+	return false;
+}
 
-		const assistantText = normalizeSnippet(extractTextParts(entry.message.content).join("\n"), DIGEST_MAX_ASSISTANT_CHARS);
-		if (assistantText) {
-			pushUnique(
-				recentAssistantUpdates,
-				recentAssistantUpdatesSeen,
-				assistantText,
-				DIGEST_MAX_ASSISTANT_UPDATES,
-			);
-		}
+function normalizeTitle(text: string): string {
+	let title = firstSentence(normalizeSnippet(text, TITLE_MAX_CHARS));
+	title = title.replace(/^the\s+/i, "");
+	title = title.replace(/\bin this (?:repo|codebase)\b/gi, "");
+	title = title.replace(/\bfor this (?:repo|codebase)\b/gi, "");
+	title = sanitizeInline(title).replace(/[.?!:;,]+$/g, "").trim();
+	title = truncate(title, TITLE_MAX_CHARS);
+	return capitalizeFirst(title);
+}
 
-		for (const toolCall of extractToolCalls(entry.message.content)) {
-			const files = extractTouchedFiles(ctx, toolCall.name, toolCall.arguments);
-			for (const file of files) {
-				pushUnique(touchedFiles, touchedFilesSeen, file, DIGEST_MAX_TOUCHED_FILES);
+function isValidWorkTitle(text: string): boolean {
+	const title = normalizeTitle(text);
+	if (!title || title.length < 6) return false;
+	if (/[\n\r{}\[\]<>"`]/.test(title)) return false;
+	if (/\/Users\/|runtime\/instances|agent\/sessions|\.jsonl\b/i.test(title)) return false;
+	if (isProceduralRequest(title) || isReferentialFollowup(title)) return false;
+	return extractTopicTokens(title).length >= 2;
+}
+
+function topicKeyFromTokens(tokens: string[]): string {
+	return tokens.join(" ");
+}
+
+function topicOverlap(a: string[], b: string[]): number {
+	if (a.length === 0 || b.length === 0) return 0;
+	const aSet = new Set(a);
+	let shared = 0;
+	for (const token of b) {
+		if (aSet.has(token)) shared += 1;
+	}
+	return shared / Math.min(a.length, b.length);
+}
+
+function classifyRequestKind(text: string): "task" | "inquiry" | "generic" {
+	if (!text) return "generic";
+	if (isProceduralRequest(text) || isReferentialFollowup(text)) return "generic";
+	if (/^(?:what|why|where|when|how|who|which)\b/i.test(text)) return "inquiry";
+	if (/^(?:do|did|does|is|are|was|were|have|has)\b/i.test(text)) return "inquiry";
+	return "task";
+}
+
+function titleFromRequestText(text: string, kind: "task" | "inquiry"): string {
+	let title = stripLeadingPreamble(firstSentence(text));
+
+	if (kind === "task") {
+		const rewrites: Array<[RegExp, string]> = [
+			[/^(?:can|could|would)\s+(?:we|you)\s+add\s+/i, "Add "],
+			[/^(?:can|could|would)\s+(?:we|you)\s+remove\s+/i, "Remove "],
+			[/^(?:can|could|would)\s+(?:we|you)\s+rename\s+/i, "Rename "],
+			[/^(?:can|could|would)\s+(?:we|you)\s+fix\s+/i, "Fix "],
+			[/^(?:can|could|would)\s+(?:we|you)\s+update\s+/i, "Update "],
+			[/^(?:can|could|would)\s+(?:we|you)\s+implement\s+/i, "Implement "],
+			[/^(?:can|could|would)\s+(?:we|you)\s+review\s+/i, "Review "],
+			[/^(?:can|could|would)\s+(?:we|you)\s+refactor\s+/i, "Refactor "],
+			[/^(?:can|could|would)\s+(?:we|you)\s+/i, ""],
+		];
+		for (const [pattern, replacement] of rewrites) {
+			if (pattern.test(title)) {
+				title = title.replace(pattern, replacement);
+				break;
 			}
-
-			pushUnique(
-				recentActions,
-				recentActionsSeen,
-				inferActionLabel(toolCall.name, toolCall.arguments, files),
-				DIGEST_MAX_ACTIONS,
-			);
+		}
+	} else {
+		const rewrites: Array<[RegExp, string]> = [
+			[/^what(?:'s| is) the status of\s+/i, "Status of "],
+			[/^why do we have\s+/i, ""],
+			[/^why (?:is|are) there\s+/i, ""],
+			[/^why (?:is|are)\s+/i, ""],
+			[/^how (?:do|does|did)\s+/i, "How "],
+			[/^where (?:is|are)\s+/i, "Where "],
+		];
+		for (const [pattern, replacement] of rewrites) {
+			if (pattern.test(title)) {
+				title = title.replace(pattern, replacement);
+				break;
+			}
 		}
 	}
 
+	return normalizeTitle(title);
+}
+
+function deriveTitleFromRequest(rawText: string): RequestWorkTitle | undefined {
+	const requestText = normalizeSnippet(rawText, REQUEST_MAX_CHARS);
+	if (!requestText) return undefined;
+
+	const sentence = stripLeadingPreamble(firstSentence(requestText));
+	if (/\bconvo mode\b|\bagreed summary and implementation plan\b|\[CONVO_COMPLETE\]/i.test(sentence)) {
+		return undefined;
+	}
+	const kind = classifyRequestKind(sentence);
+	if (kind === "generic") return undefined;
+
+	const requestTokens = extractTopicTokens(sentence);
+	if (!hasStrongTopicSignal(sentence, requestTokens)) return undefined;
+
+	const title = titleFromRequestText(sentence, kind);
+	if (!isValidWorkTitle(title)) return undefined;
+
+	const titleTokens = extractTopicTokens(title);
+	const tokens = titleTokens.length > 0 ? titleTokens : requestTokens;
 	return {
-		initialRequest,
-		latestRequest,
-		latestSubstantiveRequest,
-		recentAssistantUpdates,
-		touchedFiles,
-		recentActions,
+		title,
+		topicKey: topicKeyFromTokens(tokens),
+		tokens,
+		source: "request",
+		kind,
 	};
 }
 
-function formatSessionDigest(digest: SessionDigest): string {
-	const lines: string[] = [];
-	if (digest.initialRequest) lines.push(`Initial goal: ${digest.initialRequest}`);
-	if (digest.latestRequest) lines.push(`Latest user request: ${digest.latestRequest}`);
-	if (
-		digest.latestSubstantiveRequest &&
-		digest.latestSubstantiveRequest !== digest.latestRequest
-	) {
-		lines.push(`Latest substantive request: ${digest.latestSubstantiveRequest}`);
-	}
-	if (digest.recentAssistantUpdates.length > 0) {
-		lines.push("Recent assistant updates:");
-		for (const update of digest.recentAssistantUpdates) {
-			lines.push(`- ${update}`);
+function deriveTitleFromSessionName(sessionName?: string | null): DerivedWorkTitle | undefined {
+	if (!sessionName) return undefined;
+	const title = normalizeTitle(sessionName);
+	if (!isValidWorkTitle(title)) return undefined;
+	const tokens = extractTopicTokens(title);
+	return {
+		title,
+		topicKey: topicKeyFromTokens(tokens),
+		tokens,
+		source: "sessionName",
+	};
+}
+
+function readStoredWorkTitleState(data: unknown): StoredWorkTitleState | undefined {
+	if (!data || typeof data !== "object") return undefined;
+	const entry = data as { title?: unknown; topicKey?: unknown; updatedAt?: unknown };
+	if (typeof entry.title !== "string" || typeof entry.topicKey !== "string") return undefined;
+	return {
+		title: entry.title,
+		topicKey: entry.topicKey,
+		updatedAt: typeof entry.updatedAt === "string" ? entry.updatedAt : new Date().toISOString(),
+	};
+}
+
+function deriveTitleFromStoredState(data: unknown): DerivedWorkTitle | undefined {
+	const stored = readStoredWorkTitleState(data);
+	if (!stored) return undefined;
+	const title = normalizeTitle(stored.title);
+	if (!isValidWorkTitle(title)) return undefined;
+	const tokens = extractTopicTokens(title);
+	return {
+		title,
+		topicKey: stored.topicKey,
+		tokens,
+		source: "stored",
+		updatedAt: stored.updatedAt,
+	};
+}
+
+function shouldReplaceWorkTitle(current: DerivedWorkTitle | undefined, next: RequestWorkTitle): boolean {
+	if (!current) return true;
+	if (current.topicKey === next.topicKey) return false;
+	if (topicOverlap(current.tokens, next.tokens) >= SAME_TOPIC_OVERLAP) return false;
+	if (next.kind === "inquiry" && next.tokens.length < 3) return false;
+	return true;
+}
+
+function deriveWorkTitleFromBranch(ctx: ExtensionContext, sessionName?: string | null): DerivedWorkTitle | undefined {
+	const namedTitle = deriveTitleFromSessionName(sessionName);
+	const branch = ctx.sessionManager.getBranch() as SessionBranchEntry[];
+	let current: DerivedWorkTitle | undefined;
+
+	for (const entry of branch) {
+		if (entry.type === "custom" && entry.customType === STATE_ENTRY) {
+			const stored = deriveTitleFromStoredState(entry.data);
+			if (stored) current = stored;
+			continue;
 		}
-	}
-	if (digest.touchedFiles.length > 0) {
-		lines.push(`Touched files: ${digest.touchedFiles.join(", ")}`);
-	}
-	if (digest.recentActions.length > 0) {
-		lines.push(`Recent actions: ${digest.recentActions.join(", ")}`);
-	}
-	return lines.join("\n");
-}
 
-function buildSummaryPrompt(ctx: ExtensionContext, digest: SessionDigest, sessionName?: string): string {
-	const sessionFile = ctx.sessionManager.getSessionFile() ?? "ephemeral";
-
-	return [
-		"Summarize the work currently in progress in this coding session.",
-		"Return only a single plain-text sentence, max 18 words.",
-		"Focus on the current implementation task or investigation.",
-		"The summary will be used as titles in navigation.",
-		"Prefer the underlying task/topic over transient actions like commit, push, or reload.",
-		"Use the structured digest below, not raw tool syntax.",
-		"Do not output JSON, file contents, shell commands, or path fragments.",
-		"Do not use bullets, markdown, quotes, prefixes, or hedging commentary.",
-		`Working directory: ${ctx.cwd}`,
-		`Session file: ${sessionFile}`,
-		`Session name: ${sessionName ?? "(none)"}`,
-		"",
-		"<session-digest>",
-		formatSessionDigest(digest) || "No task digest available yet.",
-		"</session-digest>",
-	].join("\n");
-}
-
-function buildFallbackWorkSummary(digest: SessionDigest): string | undefined {
-	const files = digest.touchedFiles.slice(-2);
-	const latestRequest = digest.latestRequest ? normalizeSummaryCandidate(digest.latestRequest) : undefined;
-	const substantiveRequest = digest.latestSubstantiveRequest
-		? normalizeSummaryCandidate(digest.latestSubstantiveRequest)
-		: undefined;
-	const initialRequest = digest.initialRequest ? normalizeSummaryCandidate(digest.initialRequest) : undefined;
-	const latestAssistantUpdate = digest.recentAssistantUpdates.at(-1)
-		? normalizeSummaryCandidate(digest.recentAssistantUpdates.at(-1) ?? "")
-		: undefined;
-
-	const candidates: Array<string | undefined> = [];
-	if (latestRequest && isGenericFollowupRequest(latestRequest) && files.length > 0) {
-		candidates.push(`${latestRequest} in ${files.join(", ")}`);
-	}
-	candidates.push(substantiveRequest);
-	candidates.push(latestRequest);
-	if (files.length > 0) {
-		const lead = digest.recentActions.some((action) => action === "edited project files" || action === "wrote project files")
-			? "Editing"
-			: "Working in";
-		candidates.push(`${lead} ${files.join(", ")}`);
-	}
-	candidates.push(initialRequest);
-	candidates.push(latestAssistantUpdate);
-
-	for (const candidate of candidates) {
+		if (entry.type !== "message" || entry.message?.role !== "user") continue;
+		const requestText = extractTextParts(entry.message.content).join("\n");
+		const candidate = deriveTitleFromRequest(requestText);
 		if (!candidate) continue;
-		const normalized = normalizeSummaryCandidate(candidate);
-		if (isValidSummaryCandidate(normalized)) {
-			return normalized;
-		}
+		if (shouldReplaceWorkTitle(current, candidate)) current = candidate;
 	}
 
-	return undefined;
-}
-
-function extractSummaryText(content: unknown): string | undefined {
-	if (!Array.isArray(content)) return undefined;
-	const text = content
-		.filter((part): part is { type: "text"; text: string } => {
-			return (
-				!!part &&
-				typeof part === "object" &&
-				(part as { type?: unknown }).type === "text" &&
-				typeof (part as { text?: unknown }).text === "string"
-			);
-		})
-		.map((part) => part.text)
-		.join(" ");
-	const normalized = normalizeSummaryCandidate(text);
-	return isValidSummaryCandidate(normalized) ? normalized : undefined;
+	return namedTitle ?? current;
 }
 
 async function ensureRegistryDir(): Promise<void> {
@@ -414,10 +523,7 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 	let lastKnownModel: ActiveSessionRecord["model"];
 	let latestWorkSummary: string | undefined;
 	let latestWorkSummaryUpdatedAt: string | undefined;
-	let summaryRunInFlight = false;
-	let summaryRefreshRequested = false;
-	let summaryGeneration = 0;
-	let lastSummarizedLeafId: string | undefined;
+	let latestWorkTopicKey: string | undefined;
 
 	function buildRecord(ctx: ExtensionContext): ActiveSessionRecord {
 		return {
@@ -456,7 +562,6 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 			const pidPart = file.slice(0, -5);
 			const otherPid = Number.parseInt(pidPart, 10);
 			if (!Number.isFinite(otherPid) || otherPid === pid) continue;
-
 			if (isProcessAlive(otherPid)) continue;
 
 			try {
@@ -487,63 +592,25 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 		}, HEARTBEAT_MS);
 	}
 
-	async function refreshWorkSummary(ctx: ExtensionContext): Promise<void> {
+	async function updateWorkTitle(ctx: ExtensionContext, options?: { persist?: boolean }): Promise<void> {
 		latestContext = ctx;
-		summaryRefreshRequested = true;
-		if (summaryRunInFlight) return;
+		const derived = deriveWorkTitleFromBranch(ctx, pi.getSessionName() ?? undefined);
+		const nextTitle = derived?.title;
+		const nextTopicKey = derived?.topicKey;
+		const changed = nextTitle !== latestWorkSummary || nextTopicKey !== latestWorkTopicKey;
+		if (!changed) return;
 
-		summaryRunInFlight = true;
-		try {
-			while (summaryRefreshRequested) {
-				summaryRefreshRequested = false;
-				const currentCtx = latestContext;
-				if (!currentCtx) continue;
+		latestWorkSummary = nextTitle;
+		latestWorkTopicKey = nextTopicKey;
+		latestWorkSummaryUpdatedAt = nextTitle ? new Date().toISOString() : undefined;
 
-				const leafId = currentCtx.sessionManager.getLeafId() ?? undefined;
-				if (leafId && leafId === lastSummarizedLeafId) continue;
-
-				const generation = ++summaryGeneration;
-				const digest = buildSessionDigest(currentCtx);
-				let summary = buildFallbackWorkSummary(digest);
-
-				if (currentCtx.model) {
-					try {
-						const apiKey = await currentCtx.modelRegistry.getApiKey(currentCtx.model);
-						if (apiKey) {
-							const response = await complete(
-								currentCtx.model,
-								{
-									messages: [
-										{
-											role: "user",
-											content: [{ type: "text", text: buildSummaryPrompt(currentCtx, digest, pi.getSessionName() ?? undefined) }],
-											timestamp: Date.now(),
-										},
-									],
-								},
-								{ apiKey, maxTokens: 80 },
-							);
-							summary = extractSummaryText(response.content) ?? summary;
-						}
-					} catch {
-						// Fall back to deterministic digest-based summary on provider/model failures.
-					}
-				}
-
-				if (!summary || generation !== summaryGeneration) continue;
-
-				latestWorkSummary = summary;
-				latestWorkSummaryUpdatedAt = new Date().toISOString();
-				lastSummarizedLeafId = leafId;
-				await publish(currentCtx);
-			}
-		} finally {
-			summaryRunInFlight = false;
+		if (options?.persist && derived?.source === "request" && nextTitle && nextTopicKey) {
+			pi.appendEntry(STATE_ENTRY, {
+				title: nextTitle,
+				topicKey: nextTopicKey,
+				updatedAt: latestWorkSummaryUpdatedAt,
+			});
 		}
-	}
-
-	function requestWorkSummaryRefresh(ctx: ExtensionContext): void {
-		void refreshWorkSummary(ctx);
 	}
 
 	pi.registerCommand("active-sessions-path", {
@@ -562,25 +629,22 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 				id: ctx.model.id,
 			}
 			: undefined;
-		lastSummarizedLeafId = undefined;
 		await cleanupStaleEntries();
+		await updateWorkTitle(ctx);
 		await publish(ctx);
 		startHeartbeat(ctx);
-		requestWorkSummaryRefresh(ctx);
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
 		latestContext = ctx;
-		lastSummarizedLeafId = undefined;
+		await updateWorkTitle(ctx);
 		await publish(ctx);
-		requestWorkSummaryRefresh(ctx);
 	});
 
 	pi.on("session_fork", async (_event, ctx) => {
 		latestContext = ctx;
-		lastSummarizedLeafId = undefined;
+		await updateWorkTitle(ctx);
 		await publish(ctx);
-		requestWorkSummaryRefresh(ctx);
 	});
 
 	pi.on("model_select", async (event, ctx) => {
@@ -590,7 +654,6 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 			id: event.model.id,
 		};
 		await publish(ctx);
-		requestWorkSummaryRefresh(ctx);
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
@@ -600,7 +663,8 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_end", async (_event, ctx) => {
 		latestContext = ctx;
-		requestWorkSummaryRefresh(ctx);
+		await updateWorkTitle(ctx, { persist: true });
+		await publish(ctx);
 	});
 
 	pi.on("session_shutdown", async () => {
