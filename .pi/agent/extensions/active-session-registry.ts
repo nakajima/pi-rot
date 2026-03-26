@@ -1,23 +1,7 @@
 import { mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
-
-interface ActiveSessionRecord {
-	pid: number;
-	cwd: string;
-	sessionFile: string | null;
-	sessionId: string;
-	sessionName?: string;
-	model?: {
-		provider: string;
-		id: string;
-	};
-	startedAt: string;
-	lastSeenAt: string;
-	mode: "interactive" | "rpc" | "json" | "print" | "unknown";
-	workSummary?: string;
-	workSummaryUpdatedAt?: string;
-}
+import { type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { consumeReloadRequest, ensureReloadRequestsDir, REGISTRY_DIR, type ActiveSessionRecord } from "./reload-coordinator";
 
 interface StoredWorkTitleState {
 	title: string;
@@ -40,15 +24,23 @@ interface RequestWorkTitle extends BaseWorkTitle {
 
 type DerivedWorkTitle = BaseWorkTitle | RequestWorkTitle;
 
+type LastMessageSnapshot = {
+	text: string;
+	at?: string;
+	role: "user" | "assistant";
+};
+
 type SessionEntry = ReturnType<ExtensionContext["sessionManager"]["getEntries"]>[number];
 
 type SessionBranchEntry = SessionEntry & {
 	type: string;
+	timestamp?: unknown;
 	customType?: string;
 	data?: unknown;
 	message?: {
 		role?: string;
 		content?: unknown;
+		timestamp?: unknown;
 	};
 };
 
@@ -57,12 +49,13 @@ type MessageContentPart = {
 	text?: string;
 };
 
-const REGISTRY_DIR = join(getAgentDir(), "runtime", "instances");
 const STATE_ENTRY = "active-session-registry-work-title-v2";
 const HEARTBEAT_MS = 15_000;
+const RELOAD_POLL_MS = 2_000;
 const STALE_GRACE_MS = 5 * 60_000;
 const REQUEST_MAX_CHARS = 220;
 const TITLE_MAX_CHARS = 88;
+const LAST_MESSAGE_MAX_CHARS = 280;
 const SAME_TOPIC_OVERLAP = 0.3;
 
 const STOP_WORDS = new Set([
@@ -257,6 +250,17 @@ function normalizeSnippet(text: string, maxLength: number): string {
 	const normalized = sanitizeInline(stripMarkdownArtifacts(text));
 	if (!normalized) return "";
 	return truncate(normalized, maxLength);
+}
+
+function coerceTimestamp(value: unknown): string | undefined {
+	if (typeof value === "string") {
+		const trimmed = value.trim();
+		return trimmed ? trimmed : undefined;
+	}
+	if (typeof value === "number" && Number.isFinite(value)) {
+		return new Date(value).toISOString();
+	}
+	return undefined;
 }
 
 function firstSentence(text: string): string {
@@ -503,6 +507,26 @@ function deriveWorkTitleFromBranch(ctx: ExtensionContext, sessionName?: string |
 	return namedTitle ?? current;
 }
 
+function deriveLastMessageFromBranch(ctx: ExtensionContext): LastMessageSnapshot | undefined {
+	const branch = ctx.sessionManager.getBranch() as SessionBranchEntry[];
+
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const entry = branch[i];
+		if (!entry || entry.type !== "message" || !entry.message) continue;
+		const role = entry.message.role;
+		if (role !== "user" && role !== "assistant") continue;
+		const text = normalizeSnippet(extractTextParts(entry.message.content).join("\n"), LAST_MESSAGE_MAX_CHARS);
+		if (!text) continue;
+		return {
+			text,
+			at: coerceTimestamp(entry.timestamp) ?? coerceTimestamp(entry.message.timestamp),
+			role,
+		};
+	}
+
+	return undefined;
+}
+
 async function ensureRegistryDir(): Promise<void> {
 	await mkdir(REGISTRY_DIR, { recursive: true });
 }
@@ -519,11 +543,16 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 	const mode = detectMode(process.argv);
 	const instanceFile = join(REGISTRY_DIR, `${pid}.json`);
 	let heartbeat: NodeJS.Timeout | undefined;
+	let reloadPoll: NodeJS.Timeout | undefined;
 	let latestContext: ExtensionContext | undefined;
 	let lastKnownModel: ActiveSessionRecord["model"];
 	let latestWorkSummary: string | undefined;
 	let latestWorkSummaryUpdatedAt: string | undefined;
 	let latestWorkTopicKey: string | undefined;
+	let latestLastMessage: string | undefined;
+	let latestLastMessageAt: string | undefined;
+	let latestLastMessageRole: ActiveSessionRecord["lastMessageRole"];
+	let selfReloadQueued = false;
 	let publishQueue: Promise<void> = Promise.resolve();
 
 	function buildRecord(ctx: ExtensionContext): ActiveSessionRecord {
@@ -544,6 +573,9 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 			mode,
 			workSummary: latestWorkSummary,
 			workSummaryUpdatedAt: latestWorkSummaryUpdatedAt,
+			lastMessage: latestLastMessage,
+			lastMessageAt: latestLastMessageAt,
+			lastMessageRole: latestLastMessageRole,
 		};
 	}
 
@@ -586,18 +618,42 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 			clearInterval(heartbeat);
 			heartbeat = undefined;
 		}
+		if (reloadPoll) {
+			clearInterval(reloadPoll);
+			reloadPoll = undefined;
+		}
 		await publishQueue.catch(() => undefined);
 		await rm(instanceFile, { force: true }).catch(() => undefined);
 	}
 
+	async function checkForQueuedReload(ctx: ExtensionContext): Promise<void> {
+		if (selfReloadQueued || mode !== "interactive") return;
+		const request = await consumeReloadRequest(pid);
+		if (!request) return;
+		selfReloadQueued = true;
+		if (ctx.hasUI) {
+			const source = request.requestedByPid ? ` from pid ${request.requestedByPid}` : "";
+			ctx.ui.notify(`Queued /reload${source}.`, "info");
+		}
+		pi.sendUserMessage("/reload", { deliverAs: "followUp" });
+	}
+
 	function startHeartbeat(ctx: ExtensionContext): void {
 		latestContext = ctx;
-		if (heartbeat) return;
-		heartbeat = setInterval(() => {
-			if (latestContext) {
-				void publish(latestContext);
-			}
-		}, HEARTBEAT_MS);
+		if (!heartbeat) {
+			heartbeat = setInterval(() => {
+				if (latestContext) {
+					void publish(latestContext);
+				}
+			}, HEARTBEAT_MS);
+		}
+		if (!reloadPoll) {
+			reloadPoll = setInterval(() => {
+				if (latestContext) {
+					void checkForQueuedReload(latestContext);
+				}
+			}, RELOAD_POLL_MS);
+		}
 	}
 
 	async function updateWorkTitle(ctx: ExtensionContext, options?: { persist?: boolean }): Promise<void> {
@@ -621,6 +677,14 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 		}
 	}
 
+	function updateLastMessage(ctx: ExtensionContext): void {
+		latestContext = ctx;
+		const lastMessage = deriveLastMessageFromBranch(ctx);
+		latestLastMessage = lastMessage?.text;
+		latestLastMessageAt = lastMessage?.at;
+		latestLastMessageRole = lastMessage?.role;
+	}
+
 	pi.registerCommand("active-sessions-path", {
 		description: "Show the directory where the active pi session registry is written",
 		handler: async (_args, ctx) => {
@@ -638,21 +702,28 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 			}
 			: undefined;
 		await cleanupStaleEntries();
+		await ensureReloadRequestsDir();
 		await updateWorkTitle(ctx);
+		updateLastMessage(ctx);
 		await publish(ctx);
 		startHeartbeat(ctx);
+		await checkForQueuedReload(ctx);
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
 		latestContext = ctx;
 		await updateWorkTitle(ctx);
+		updateLastMessage(ctx);
 		await publish(ctx);
+		await checkForQueuedReload(ctx);
 	});
 
 	pi.on("session_fork", async (_event, ctx) => {
 		latestContext = ctx;
 		await updateWorkTitle(ctx);
+		updateLastMessage(ctx);
 		await publish(ctx);
+		await checkForQueuedReload(ctx);
 	});
 
 	pi.on("model_select", async (event, ctx) => {
@@ -662,17 +733,22 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 			id: event.model.id,
 		};
 		await publish(ctx);
+		await checkForQueuedReload(ctx);
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
 		latestContext = ctx;
+		updateLastMessage(ctx);
 		await publish(ctx);
+		await checkForQueuedReload(ctx);
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
 		latestContext = ctx;
 		await updateWorkTitle(ctx, { persist: true });
+		updateLastMessage(ctx);
 		await publish(ctx);
+		await checkForQueuedReload(ctx);
 	});
 
 	pi.on("session_shutdown", async () => {
