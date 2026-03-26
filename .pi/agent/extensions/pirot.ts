@@ -12,25 +12,45 @@ function syncCompletions(prefix: string): AutocompleteItem[] | null {
 	return filtered.length > 0 ? filtered : null;
 }
 
+async function summarizeChanges(pi: ExtensionAPI, diff: string): Promise<string> {
+	const truncated = diff.length > 8000 ? `${diff.slice(0, 8000)}\n... (truncated)` : diff;
+	const prompt = `Summarize these git changes in 1-2 concise sentences describing what was changed and why (infer intent). No markdown, no bullet points, just plain text.\n\n${truncated}`;
+	const result = await pi.exec("pi", ["-p", "--no-session", "--model", "claude-haiku-4-5", prompt], { timeout: 30_000 });
+	if (result.code !== 0 || !result.stdout.trim()) return "";
+	return result.stdout.trim();
+}
+
 async function handleLocalChanges(pi: ExtensionAPI, ctx: ExtensionCommandContext, repoRoot: string): Promise<boolean> {
 	const statusResult = await pi.exec("git", ["status", "--porcelain"], { cwd: repoRoot, timeout: 10_000 });
 	if (statusResult.code !== 0 || !statusResult.stdout.trim()) {
 		return true; // No local changes (or error checking), proceed with pull
 	}
 
+	ctx.ui.notify("Summarizing local changes...", "info");
+
+	// Get the full diff for summarization
+	const diffResult = await pi.exec("git", ["diff", "HEAD"], { cwd: repoRoot, timeout: 10_000 });
 	const lines = statusResult.stdout.trim().split("\n");
-	const summary = lines
-		.map((line) => {
-			const status = line.substring(0, 2).trim();
-			const file = line.substring(3);
-			const label = status === "M" ? "modified" : status === "A" ? "added" : status === "D" ? "deleted" : status === "??" ? "untracked" : status;
-			return `  ${label}: ${file}`;
-		})
-		.join("\n");
+	const untracked = lines.filter((l) => l.startsWith("??")).map((l) => l.substring(3));
 
-	ctx.ui.notify(`Local changes found:\n${summary}`, "warning");
+	// Include untracked file contents in the diff context
+	let fullDiff = diffResult.stdout || "";
+	for (const file of untracked.slice(0, 5)) {
+		const cat = await pi.exec("head", ["-c", "2000", file], { cwd: repoRoot, timeout: 5_000 });
+		if (cat.code === 0 && cat.stdout) fullDiff += `\n--- /dev/null\n+++ b/${file}\n${cat.stdout}`;
+	}
 
-	const shouldPush = await ctx.ui.confirm("Local changes", `${lines.length} local change${lines.length === 1 ? "" : "s"} found. Commit and push before pulling?`);
+	const summary = await summarizeChanges(pi, fullDiff);
+	const fileCount = lines.length;
+
+	if (summary) {
+		ctx.ui.notify(summary, "info");
+	}
+
+	const confirmMsg = summary
+		? `${summary}\n\n${fileCount} file${fileCount === 1 ? "" : "s"} changed. Commit and push before pulling?`
+		: `${fileCount} file${fileCount === 1 ? "" : "s"} changed. Commit and push before pulling?`;
+	const shouldPush = await ctx.ui.confirm("Local changes", confirmMsg);
 	if (!shouldPush) {
 		return true; // User declined, proceed with pull anyway
 	}
@@ -42,8 +62,8 @@ async function handleLocalChanges(pi: ExtensionAPI, ctx: ExtensionCommandContext
 		return false;
 	}
 
-	// Commit
-	const commitMsg = `sync: ${lines.length} file${lines.length === 1 ? "" : "s"} changed`;
+	// Use the LLM summary as the commit message, or fall back to file list
+	const commitMsg = summary || `sync: ${fileCount} file${fileCount === 1 ? "" : "s"} changed`;
 	const commitResult = await pi.exec("git", ["commit", "-m", commitMsg], { cwd: repoRoot, timeout: 30_000 });
 	if (commitResult.code !== 0) {
 		ctx.ui.notify(`Commit failed: ${(commitResult.stderr || commitResult.stdout).trim()}`, "error");
@@ -51,14 +71,14 @@ async function handleLocalChanges(pi: ExtensionAPI, ctx: ExtensionCommandContext
 	}
 
 	// Push
-	ctx.ui.notify("Pushing local changes...", "info");
+	ctx.ui.notify("Pushing...", "info");
 	const pushResult = await pi.exec("git", ["push"], { cwd: repoRoot, timeout: 120_000 });
 	if (pushResult.code !== 0) {
 		ctx.ui.notify(`Push failed: ${(pushResult.stderr || pushResult.stdout).trim()}`, "error");
 		return false;
 	}
 
-	ctx.ui.notify("Local changes pushed.", "success");
+	ctx.ui.notify("Pushed.", "success");
 	return true;
 }
 
