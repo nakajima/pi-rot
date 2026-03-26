@@ -5,6 +5,7 @@ import {
   getState,
   watchRegistry,
   watchSessionFile,
+  summarizeMissingSessions,
   type ChangeCallback,
 } from "./sessions";
 import { sendPrompt } from "./rpc";
@@ -118,6 +119,11 @@ async function handleMessage(
           data: sessions,
         })
       );
+
+      // Generate summaries in background for sessions that lack one
+      summarizeMissingSessions(sessions, () => {
+        broadcastSessionsDebounced();
+      });
       break;
     }
 
@@ -214,6 +220,28 @@ async function handleMessage(
     default:
       throw new Error(`Unknown message type: ${msg.type}`);
   }
+}
+
+// MARK: - Debounced session broadcast
+
+let sessionsBroadcastDebounce: ReturnType<typeof setTimeout> | null = null;
+
+function broadcastSessionsDebounced() {
+  if (sessionsBroadcastDebounce) clearTimeout(sessionsBroadcastDebounce);
+  sessionsBroadcastDebounce = setTimeout(async () => {
+    try {
+      const sessions = await listSessions();
+      const payload = JSON.stringify({
+        type: "sessions_updated",
+        data: sessions,
+      });
+      for (const client of clients) {
+        client.send(payload);
+      }
+    } catch {
+      // ignore
+    }
+  }, 2000);
 }
 
 // MARK: - Registry watcher → broadcast session updates
