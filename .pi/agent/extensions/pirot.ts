@@ -7,8 +7,12 @@ import { requestReloadForOtherInteractiveSessions } from "./reload-coordinator";
 
 const PIROT_REPO_DIR = join(homedir(), "apps", "pirot");
 
-function syncCompletions(prefix: string): AutocompleteItem[] | null {
-	const items: AutocompleteItem[] = [{ value: "sync", label: "sync" }];
+function subcommandCompletions(prefix: string): AutocompleteItem[] | null {
+	const items: AutocompleteItem[] = [
+		{ value: "sync", label: "sync" },
+		{ value: "install-server", label: "install-server" },
+		{ value: "uninstall-server", label: "uninstall-server" },
+	];
 	const filtered = items.filter((item) => item.value.startsWith(prefix.trim()));
 	return filtered.length > 0 ? filtered : null;
 }
@@ -98,7 +102,7 @@ async function handleLocalChanges(pi: ExtensionAPI, ctx: ExtensionCommandContext
 		return false;
 	}
 
-	ctx.ui.notify("Pushed.", "success");
+	ctx.ui.notify("Pushed.", "info");
 	return true;
 }
 
@@ -141,10 +145,33 @@ async function handleSync(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promi
 	return;
 }
 
+async function handleServerCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, command: string): Promise<void> {
+	const serverCli = join(PIROT_REPO_DIR, "server", "src", "cli.ts");
+	ctx.ui.notify(`Running ${command}...`, "info");
+
+	const result = await pi.exec("bun", ["run", serverCli, command], {
+		cwd: PIROT_REPO_DIR,
+		timeout: 30_000,
+	});
+
+	if (result.code !== 0) {
+		const msg = (result.stderr || result.stdout || "unknown error").trim();
+		ctx.ui.notify(`${command} failed: ${msg}`, "error");
+		return;
+	}
+
+	const output = (result.stdout || "").trim();
+	if (output) {
+		ctx.ui.notify(output, "info");
+	} else {
+		ctx.ui.notify(`${command} completed.`, "info");
+	}
+}
+
 export default function pirotExtension(pi: ExtensionAPI) {
 	pi.registerCommand("pirot", {
 		description: "Pirot repo commands",
-		getArgumentCompletions: syncCompletions,
+		getArgumentCompletions: subcommandCompletions,
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			if (trimmed === "sync") {
@@ -152,7 +179,12 @@ export default function pirotExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			ctx.ui.notify("Usage: /pirot sync", "info");
+			if (trimmed === "install-server" || trimmed === "uninstall-server") {
+				await handleServerCommand(pi, ctx, trimmed);
+				return;
+			}
+
+			ctx.ui.notify("Usage: /pirot sync | install-server | uninstall-server", "info");
 		},
 	});
 }
