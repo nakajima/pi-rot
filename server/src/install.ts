@@ -75,6 +75,9 @@ function installLaunchd(bunPath: string, serverEntry: string, port: number) {
   const plistPath = launchdPlistPath();
   const logPath = join(homedir(), "Library", "Logs", `${SERVICE_NAME}.log`);
 
+  // Capture the current PATH so pi/node/bun are all findable at runtime
+  const currentPath = process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin";
+
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -91,6 +94,8 @@ function installLaunchd(bunPath: string, serverEntry: string, port: number) {
   <dict>
     <key>PIMUX2000_PORT</key>
     <string>${port}</string>
+    <key>PATH</key>
+    <string>${currentPath}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

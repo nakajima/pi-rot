@@ -100,6 +100,10 @@ const summarizeInFlight = new Set<string>();
 
 // MARK: - LLM-based summary generation
 
+// Resolve paths at startup — launchd has a minimal PATH
+const BUN_BIN = process.execPath; // we're already running under bun
+const PI_SCRIPT = join(homedir(), ".bun", "bin", "pi");
+
 const summaryCache = new Map<
   string,
   { summary: string; messageCount: number }
@@ -151,8 +155,8 @@ async function summarizeWithPi(
     };
 
     const proc = spawn(
-      "pi",
-      ["-p", "--no-session", "--model", "anthropic/claude-haiku-4-5", prompt],
+      BUN_BIN,
+      [PI_SCRIPT, "-p", "--no-session", "--model", "anthropic/claude-haiku-4-5", prompt],
       { stdio: ["ignore", "pipe", "pipe"] }
     );
 
