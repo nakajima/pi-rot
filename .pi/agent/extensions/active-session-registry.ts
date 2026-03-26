@@ -508,7 +508,7 @@ async function ensureRegistryDir(): Promise<void> {
 }
 
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
-	const tempPath = `${path}.${process.pid}.tmp`;
+	const tempPath = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
 	await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 	await rename(tempPath, path);
 }
@@ -524,6 +524,7 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 	let latestWorkSummary: string | undefined;
 	let latestWorkSummaryUpdatedAt: string | undefined;
 	let latestWorkTopicKey: string | undefined;
+	let publishQueue: Promise<void> = Promise.resolve();
 
 	function buildRecord(ctx: ExtensionContext): ActiveSessionRecord {
 		return {
@@ -547,8 +548,14 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 	}
 
 	async function publish(ctx: ExtensionContext): Promise<void> {
-		await ensureRegistryDir();
-		await writeJsonAtomic(instanceFile, buildRecord(ctx));
+		const record = buildRecord(ctx);
+		publishQueue = publishQueue
+			.catch(() => undefined)
+			.then(async () => {
+				await ensureRegistryDir();
+				await writeJsonAtomic(instanceFile, record);
+			});
+		return publishQueue;
 	}
 
 	async function cleanupStaleEntries(): Promise<void> {
@@ -579,6 +586,7 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 			clearInterval(heartbeat);
 			heartbeat = undefined;
 		}
+		await publishQueue.catch(() => undefined);
 		await rm(instanceFile, { force: true }).catch(() => undefined);
 	}
 
