@@ -991,12 +991,15 @@ export default function convoExtension(pi: ExtensionAPI) {
 		}
 
 		if (choice === "Keep Planning") {
-			pi.sendUserMessage(
+			const userNote = await ctx.ui.input("Additional direction (optional):", "e.g. focus on the database schema");
+			const baseMessage =
 				mode === "complete"
 					? "Keep planning this. Stay in convo mode. Either ask the next batch of highest-value clarification questions using convo_questionnaire, or revise the plan if more refinement is needed."
-					: "You are still in /convo discovery mode. Do not stop without a next step. Either call convo_questionnaire with the next batch of highest-value clarification questions, or if the work is already clear enough, produce the final summary with Goal, Requirements, Constraints, Assumptions, Implementation plan, and Open questions: None, ending with [CONVO_COMPLETE].",
-				{ deliverAs: "followUp" },
-			);
+					: "You are still in /convo discovery mode. Do not stop without a next step. Either call convo_questionnaire with the next batch of highest-value clarification questions, or if the work is already clear enough, produce the final summary with Goal, Requirements, Constraints, Assumptions, Implementation plan, and Open questions: None, ending with [CONVO_COMPLETE].";
+			const message = userNote?.trim()
+				? `Keep planning. User direction: ${userNote.trim()}\n\n${baseMessage}`
+				: baseMessage;
+			pi.sendUserMessage(message, { deliverAs: "followUp" });
 			return;
 		}
 
