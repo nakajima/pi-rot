@@ -2,6 +2,7 @@ import { readdir, readFile } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
 import { watch, type FSWatcher } from "fs";
+import { spawn } from "child_process";
 
 // MARK: - Types
 
@@ -55,12 +56,142 @@ export async function listSessions(): Promise<RegistryEntry[]> {
     if (!file.endsWith(".json") || file.includes("-messages")) continue;
     try {
       const raw = await readFile(join(REGISTRY_DIR, file), "utf-8");
-      entries.push(JSON.parse(raw));
+      const entry: RegistryEntry = JSON.parse(raw);
+
+      // Use cached summary if registry doesn't have one
+      if (!entry.workSummary && entry.sessionFile) {
+        const cached = summaryCache.get(entry.sessionFile);
+        if (cached) entry.workSummary = cached.summary;
+      }
+
+      entries.push(entry);
     } catch {
       // skip corrupt/unreadable files
     }
   }
   return entries;
+}
+
+// Kick off background summarization for sessions missing workSummary.
+// Calls onComplete with the sessionFile and summary when each one finishes.
+export function summarizeMissingSessions(
+  entries: RegistryEntry[],
+  onComplete: (sessionFile: string, summary: string) => void
+): void {
+  for (const entry of entries) {
+    if (entry.workSummary || !entry.sessionFile) continue;
+    const sessionFile = entry.sessionFile;
+
+    // Already in-flight or cached
+    if (summaryCache.has(sessionFile) || summarizeInFlight.has(sessionFile))
+      continue;
+
+    summarizeInFlight.add(sessionFile);
+    deriveWorkSummary(sessionFile).then((summary) => {
+      summarizeInFlight.delete(sessionFile);
+      if (summary) onComplete(sessionFile, summary);
+    });
+  }
+}
+
+const summarizeInFlight = new Set<string>();
+
+// MARK: - Derive a summary from the first user message in the session file
+
+// MARK: - LLM-based summary generation
+
+const summaryCache = new Map<
+  string,
+  { summary: string; messageCount: number }
+>();
+
+async function deriveWorkSummary(
+  sessionFile: string
+): Promise<string | undefined> {
+  const messages = await getMessages(sessionFile);
+  if (messages.length === 0) return undefined;
+
+  const cached = summaryCache.get(sessionFile);
+  if (cached && cached.messageCount === messages.length) {
+    return cached.summary;
+  }
+
+  const summary = await summarizeWithPi(messages);
+  if (summary) {
+    summaryCache.set(sessionFile, { summary, messageCount: messages.length });
+  }
+  return summary;
+}
+
+async function summarizeWithPi(
+  messages: SessionMessage[]
+): Promise<string | undefined> {
+  const recent = messages.slice(-20);
+  const transcript = recent
+    .map((m) => {
+      const text = extractText(m.content);
+      if (!text) return null;
+      const truncated =
+        text.length > 300 ? text.slice(0, 300) + "..." : text;
+      return `${m.role}: ${truncated}`;
+    })
+    .filter(Boolean)
+    .join("\n");
+
+  if (!transcript.trim()) return undefined;
+
+  const prompt = `Summarize what this coding session is working on in a single short phrase (under 60 chars). No quotes, no punctuation at the end, no emojis. Just the topic.\n\n${transcript}`;
+
+  return new Promise((resolve) => {
+    let resolved = false;
+    const done = (value: string | undefined) => {
+      if (resolved) return;
+      resolved = true;
+      resolve(value);
+    };
+
+    const proc = spawn(
+      "pi",
+      ["-p", "--no-session", "--model", "anthropic/claude-haiku-4-5", prompt],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+
+    let stdout = "";
+    proc.stdout.on("data", (d: Buffer) => {
+      stdout += d.toString();
+    });
+
+    // pi -p prints the answer then may hang; give it 15s then take what we have
+    const timeout = setTimeout(() => {
+      const text = stdout.trim();
+      if (text) done(text);
+      else done(undefined);
+      proc.kill();
+    }, 15_000);
+
+    proc.on("error", () => {
+      clearTimeout(timeout);
+      done(undefined);
+    });
+    proc.on("close", () => {
+      clearTimeout(timeout);
+      const text = stdout.trim();
+      done(text || undefined);
+    });
+  });
+}
+
+function extractText(content: unknown): string | undefined {
+  if (typeof content === "string") return content.trim() || undefined;
+  if (!Array.isArray(content)) return undefined;
+  const parts: string[] = [];
+  for (const block of content as Record<string, unknown>[]) {
+    if (block?.type === "text" && typeof block.text === "string") {
+      const text = (block.text as string).trim();
+      if (text) parts.push(text);
+    }
+  }
+  return parts.join(" ") || undefined;
 }
 
 // MARK: - Read messages from JSONL session file
