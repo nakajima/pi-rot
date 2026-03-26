@@ -12,6 +12,7 @@ function subcommandCompletions(prefix: string): AutocompleteItem[] | null {
 		{ value: "sync", label: "sync" },
 		{ value: "install-server", label: "install-server" },
 		{ value: "uninstall-server", label: "uninstall-server" },
+		{ value: "restart-server", label: "restart-server" },
 	];
 	const filtered = items.filter((item) => item.value.startsWith(prefix.trim()));
 	return filtered.length > 0 ? filtered : null;
@@ -129,6 +130,16 @@ async function handleSync(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promi
 		return;
 	}
 
+	// Restart the pimux2000 server if installed
+	const serverCli = join(PIROT_REPO_DIR, "server", "src", "cli.ts");
+	const restartResult = await pi.exec("bun", ["run", serverCli, "restart-server"], {
+		cwd: PIROT_REPO_DIR,
+		timeout: 15_000,
+	});
+	if (restartResult.code === 0) {
+		ctx.ui.notify("Restarted pimux2000 server.", "info");
+	}
+
 	const { requested, interactiveCount, skipped } = await requestReloadForOtherInteractiveSessions(process.pid, {
 		reason: "pirot-sync",
 	});
@@ -179,12 +190,12 @@ export default function pirotExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			if (trimmed === "install-server" || trimmed === "uninstall-server") {
+			if (trimmed === "install-server" || trimmed === "uninstall-server" || trimmed === "restart-server") {
 				await handleServerCommand(pi, ctx, trimmed);
 				return;
 			}
 
-			ctx.ui.notify("Usage: /pirot sync | install-server | uninstall-server", "info");
+			ctx.ui.notify("Usage: /pirot sync | install-server | uninstall-server | restart-server", "info");
 		},
 	});
 }
