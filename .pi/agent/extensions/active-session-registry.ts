@@ -542,6 +542,7 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 	const startedAt = new Date().toISOString();
 	const mode = detectMode(process.argv);
 	const instanceFile = join(REGISTRY_DIR, `${pid}.json`);
+	const messagesFile = join(REGISTRY_DIR, `${pid}-messages.json`);
 	let heartbeat: NodeJS.Timeout | undefined;
 	let reloadPoll: NodeJS.Timeout | undefined;
 	let latestContext: ExtensionContext | undefined;
@@ -598,8 +599,8 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 		for (const file of files) {
 			if (!file.endsWith(".json")) continue;
 			const fullPath = join(REGISTRY_DIR, file);
-			const pidPart = file.slice(0, -5);
-			const otherPid = Number.parseInt(pidPart, 10);
+			const baseName = file.endsWith("-messages.json") ? file.slice(0, -"-messages.json".length) : file.slice(0, -5);
+			const otherPid = Number.parseInt(baseName, 10);
 			if (!Number.isFinite(otherPid) || otherPid === pid) continue;
 			if (isProcessAlive(otherPid)) continue;
 
@@ -624,6 +625,7 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 		}
 		await publishQueue.catch(() => undefined);
 		await rm(instanceFile, { force: true }).catch(() => undefined);
+		await rm(messagesFile, { force: true }).catch(() => undefined);
 	}
 
 	async function checkForQueuedReload(ctx: ExtensionContext): Promise<void> {
@@ -675,6 +677,17 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 				updatedAt: latestWorkSummaryUpdatedAt,
 			});
 		}
+	}
+
+	async function writeMessages(ctx: ExtensionContext): Promise<void> {
+		const branch = ctx.sessionManager.getBranch() as SessionBranchEntry[];
+		const messages: unknown[] = [];
+		for (const entry of branch) {
+			if (entry.type !== "message" || !entry.message) continue;
+			messages.push(entry.message);
+		}
+		await ensureRegistryDir();
+		await writeJsonAtomic(messagesFile, messages);
 	}
 
 	function updateLastMessage(ctx: ExtensionContext): void {
@@ -740,6 +753,7 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 		latestContext = ctx;
 		updateLastMessage(ctx);
 		await publish(ctx);
+		await writeMessages(ctx);
 		await checkForQueuedReload(ctx);
 	});
 
@@ -748,6 +762,7 @@ export default function activeSessionRegistryExtension(pi: ExtensionAPI) {
 		await updateWorkTitle(ctx, { persist: true });
 		updateLastMessage(ctx);
 		await publish(ctx);
+		await writeMessages(ctx);
 		await checkForQueuedReload(ctx);
 	});
 

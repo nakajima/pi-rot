@@ -1,0 +1,12 @@
+{
+  "name": "pimux2000-server",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "pimux2000": "./src/cli.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts"
+  }
+}
