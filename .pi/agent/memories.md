@@ -1,6 +1,6 @@
 # Memories
 
-<!-- Add one memory per bullet. -->
+- If we're using an ORM of any kind, do not wrap the ORM objects in deeper levels of abstraction. Just use the ORM.
 
 ## Candidate memories
 
