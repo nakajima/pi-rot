@@ -1,4 +1,9 @@
 import { spawn } from "child_process";
+import { join } from "path";
+import { homedir } from "os";
+
+const BUN_BIN = process.execPath;
+const PI_SCRIPT = join(homedir(), ".bun", "bin", "pi");
 
 // MARK: - Types
 
@@ -22,7 +27,7 @@ export async function runRPC(
   const input = commands.map((c) => JSON.stringify(c)).join("\n") + "\n";
 
   return new Promise((resolve, reject) => {
-    const proc = spawn("pi", ["--mode", "rpc"], {
+    const proc = spawn(BUN_BIN, [PI_SCRIPT, "--mode", "rpc"], {
       cwd: cwd ?? undefined,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env },
