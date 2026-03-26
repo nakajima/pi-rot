@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { complete, getModel } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import type { AutocompleteItem } from "@mariozechner/pi-tui";
 import { requestReloadForOtherInteractiveSessions } from "./reload-coordinator";
@@ -12,12 +13,31 @@ function syncCompletions(prefix: string): AutocompleteItem[] | null {
 	return filtered.length > 0 ? filtered : null;
 }
 
-async function summarizeChanges(pi: ExtensionAPI, diff: string): Promise<string> {
+async function summarizeChanges(ctx: ExtensionCommandContext, diff: string): Promise<string> {
+	const model = getModel("anthropic", "claude-haiku-4-5");
+	if (!model) return "";
+	const apiKey = await ctx.modelRegistry.getApiKey(model);
+	if (!apiKey) return "";
+
 	const truncated = diff.length > 8000 ? `${diff.slice(0, 8000)}\n... (truncated)` : diff;
-	const prompt = `Summarize these git changes in 1-2 concise sentences describing what was changed and why (infer intent). No markdown, no bullet points, just plain text.\n\n${truncated}`;
-	const result = await pi.exec("pi", ["-p", "--no-session", "--model", "claude-haiku-4-5", prompt], { timeout: 30_000 });
-	if (result.code !== 0 || !result.stdout.trim()) return "";
-	return result.stdout.trim();
+	const response = await complete(
+		model,
+		{
+			messages: [
+				{
+					role: "user",
+					content: [{ type: "text", text: `Summarize these git changes in 1-2 concise sentences describing what was changed and why (infer intent). No markdown, no bullet points, just plain text.\n\n${truncated}` }],
+					timestamp: Date.now(),
+				},
+			],
+		},
+		{ apiKey },
+	);
+	return response.content
+		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+		.map((c) => c.text)
+		.join("")
+		.trim();
 }
 
 async function handleLocalChanges(pi: ExtensionAPI, ctx: ExtensionCommandContext, repoRoot: string): Promise<boolean> {
@@ -40,7 +60,7 @@ async function handleLocalChanges(pi: ExtensionAPI, ctx: ExtensionCommandContext
 		if (cat.code === 0 && cat.stdout) fullDiff += `\n--- /dev/null\n+++ b/${file}\n${cat.stdout}`;
 	}
 
-	const summary = await summarizeChanges(pi, fullDiff);
+	const summary = await summarizeChanges(ctx, fullDiff);
 	const fileCount = lines.length;
 
 	if (summary) {
