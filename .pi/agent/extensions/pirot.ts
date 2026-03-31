@@ -21,8 +21,8 @@ function subcommandCompletions(prefix: string): AutocompleteItem[] | null {
 async function summarizeChanges(ctx: ExtensionCommandContext, diff: string): Promise<string> {
 	const model = getModel("anthropic", "claude-haiku-4-5");
 	if (!model) return "";
-	const apiKey = await ctx.modelRegistry.getApiKey(model);
-	if (!apiKey) return "";
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+	if (!auth.ok || !auth.apiKey) return "";
 
 	const truncated = diff.length > 8000 ? `${diff.slice(0, 8000)}\n... (truncated)` : diff;
 	const response = await complete(
@@ -36,7 +36,7 @@ async function summarizeChanges(ctx: ExtensionCommandContext, diff: string): Pro
 				},
 			],
 		},
-		{ apiKey },
+		{ apiKey: auth.apiKey },
 	);
 	return response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")

@@ -160,3 +160,4 @@ export async function consumeReloadRequest(targetPid: number): Promise<ReloadReq
 export default function reloadCoordinatorExtension(_pi: ExtensionAPI) {
 	// Shared helper module for other extensions. Intentionally no-op.
 }
+
