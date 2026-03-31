@@ -662,7 +662,7 @@ export default function bumpExtension(pi: ExtensionAPI) {
 				const proposedMessage = await proposeCommitMessage(ctx, manifest, nextVersion, stagedDiff);
 				const commitMessage = await chooseCommitMessage(ctx, proposedMessage, staged);
 				await commitAndPush(pi, ctx, repoRoot, commitMessage);
-				ctx.ui.notify(`Committed and pushed ${staged.length} file${staged.length === 1 ? "" : "s"}.`, "success");
+				ctx.ui.notify(`Committed and pushed ${staged.length} file${staged.length === 1 ? "" : "s"}.`, "info");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(`bump failed: ${message}`, "error");
