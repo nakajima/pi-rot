@@ -758,11 +758,14 @@ function isResolvedOpenQuestionLine(line: string): boolean {
 	const normalized = line
 		.toLowerCase()
 		.replace(/^[\s\-–—*•\d.()]+/, "")
-		.replace(/[.!]+$/, "")
 		.replace(/\s+/g, " ")
 		.trim();
 	if (!normalized) return true;
-	return RESOLVED_OPEN_QUESTIONS.includes(normalized);
+
+	return RESOLVED_OPEN_QUESTIONS.some((resolved) => {
+		const pattern = new RegExp(`^${escapeRegExp(resolved)}(?:$|[\s:;,.!?\-–—()\[\]])`, "i");
+		return pattern.test(normalized);
+	});
 }
 
 function hasUnresolvedOpenQuestions(text: string): boolean {

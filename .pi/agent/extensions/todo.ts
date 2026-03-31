@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
@@ -43,10 +43,14 @@ async function appendTodo(path: string, body: string): Promise<"created" | "appe
 	await mkdir(dirname(path), { recursive: true });
 
 	const existing = await readTodoFile(path);
-	const prefix = existing && !existing.endsWith("\n") ? "\n" : "";
-	const nextContent = `${existing ?? ""}${prefix}${trimmed}\n`;
-	await writeFile(path, nextContent, "utf8");
-	return existing === undefined ? "created" : "appended";
+	if (existing === undefined) {
+		await writeFile(path, `${trimmed}\n`, "utf8");
+		return "created";
+	}
+
+	const prefix = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+	await appendFile(path, `${prefix}${trimmed}\n`, "utf8");
+	return "appended";
 }
 
 async function startTodoSession(pi: ExtensionAPI, ctx: ExtensionCommandContext, todoText: string): Promise<void> {
