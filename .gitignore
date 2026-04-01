@@ -24,3 +24,6 @@ coverage/
 # Local pi runtime state if it ever shows up here
 .pi/agent/global-memories.json
 .pi/agent/sessions/
+
+# Managed by pimux agent
+.pi/agent/extensions/pimux-live.ts
