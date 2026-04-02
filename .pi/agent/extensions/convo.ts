@@ -1,8 +1,8 @@
 import { readdir, readFile } from "node:fs/promises";
 import { basename, extname, join, relative } from "node:path";
-import { CustomEditor, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { Editor, type EditorTheme, Text, matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Text } from "@mariozechner/pi-tui";
 
 interface ConvoAnswer {
 	id: string;
@@ -153,31 +153,6 @@ const ConvoQuestionnaireParams = Type.Object({
 	progressCurrent: Type.Optional(Type.Integer({ description: "Current step number for the first question in this batch, e.g. 3 for question 3/N." })),
 	progressTotal: Type.Optional(Type.Integer({ description: "Estimated total number of questions across the whole discovery flow, e.g. N for question 3/N." })),
 });
-
-class ConvoEditor extends CustomEditor {
-	isConvoActive: () => boolean = () => false;
-	onExitConvo: () => void = () => {};
-
-	override handleInput(data: string): void {
-		if (matchesKey(data, "ctrl+c") && this.isConvoActive()) {
-			this.onExitConvo();
-			return;
-		}
-		super.handleInput(data);
-	}
-
-	override render(width: number): string[] {
-		const lines = super.render(width);
-		if (!this.isConvoActive() || lines.length === 0) return lines;
-
-		const label = " CONVO ";
-		const last = lines.length - 1;
-		if (visibleWidth(lines[last]!) >= label.length) {
-			lines[last] = truncateToWidth(lines[last]!, width - label.length, "") + label;
-		}
-		return lines;
-	}
-}
 
 function clamp(value: number, min: number, max: number): number {
 	return Math.max(min, Math.min(max, value));
@@ -866,7 +841,7 @@ export default function convoExtension(pi: ExtensionAPI) {
 				),
 			);
 		}
-		lines.push(ctx.ui.theme.fg("dim", "Ctrl+C exit • ↑↓ / Ctrl+P Ctrl+N navigate • Tab add context"));
+		lines.push(ctx.ui.theme.fg("dim", "Answer prompts appear in the active UI. Cancel a question to exit convo."));
 		if (state.answers.length > 0) {
 			const latest = state.answers[state.answers.length - 1]!;
 			lines.push(ctx.ui.theme.fg("dim", `Latest: ${latest.selectedLabel}`));
@@ -1018,15 +993,7 @@ export default function convoExtension(pi: ExtensionAPI) {
 		return true;
 	}
 
-	function installEditor(ctx: ExtensionContext): void {
-		if (!ctx.hasUI) return;
-		ctx.ui.setEditorComponent((tui, theme, keybindings) => {
-			const editor = new ConvoEditor(tui, theme, keybindings);
-			editor.isConvoActive = () => state.active;
-			editor.onExitConvo = () => exitConvo(ctx);
-			return editor;
-		});
-	}
+	function installEditor(_ctx: ExtensionContext): void {}
 
 	pi.registerCommand("convo", {
 		description: "Start a collaborative requirements conversation",
@@ -1065,7 +1032,7 @@ export default function convoExtension(pi: ExtensionAPI) {
 		name: "convo_questionnaire",
 		label: "Convo Questionnaire",
 		description:
-			"Ask a batch of interactive multiple-choice clarification questions during /convo mode. Use this instead of plain chat questions. The UI asks one question at a time locally, supports extra context via Tab, and avoids LLM round-trips between questions.",
+			"Ask a batch of interactive multiple-choice clarification questions during /convo mode. Use this instead of plain chat questions. The UI asks one question at a time locally, can collect optional follow-up context, and avoids LLM round-trips between questions.",
 		promptSnippet: "Ask a local batch of clarification questions during /convo mode.",
 		promptGuidelines: [
 			"During /convo mode, ask clarifying questions with convo_questionnaire instead of plain text.",
@@ -1109,20 +1076,6 @@ export default function convoExtension(pi: ExtensionAPI) {
 				normalizeProgressValue(input.progressTotal) ?? Math.max(5, minimumTotalProgress),
 			);
 
-			const newPages: ConvoAnswer[] = batch.map((question, index) => {
-				const options = normalizeOptions(question.options);
-				return {
-					id: question.id?.trim() || `convo-${history.length + index + 1}-${Date.now()}-${index}`,
-					question: question.question.trim(),
-					options,
-					selectedIndex: 0,
-					selectedLabel: options[0]!,
-					note: "",
-					progressCurrent: baseProgress + index,
-					progressTotal: totalProgress,
-				};
-			});
-
 			function setActiveBatchProgress(progress?: { current: number; total: number }): void {
 				state = {
 					...state,
@@ -1132,221 +1085,51 @@ export default function convoExtension(pi: ExtensionAPI) {
 				updateUI(ctx);
 			}
 
-			setActiveBatchProgress({ current: baseProgress, total: totalProgress });
+			const answers = [...history];
+			let current: ConvoAnswer | undefined;
 
-			const result = await ctx.ui.custom<ConvoBatchResultDetails>((tui, theme, _kb, done) => {
-				const pages: ConvoAnswer[] = [...history, ...newPages].map((answer) => ({ ...answer, options: [...answer.options] }));
-				const firstNewIndex = history.length;
-				let pageIndex = firstNewIndex;
-				let activeProgressPageIndex = firstNewIndex;
-				let optionIndex = clamp(pages[pageIndex]!.selectedIndex, 0, pages[pageIndex]!.options.length - 1);
-				let noteMode = false;
-				let cachedLines: string[] | undefined;
+			for (let index = 0; index < batch.length; index++) {
+				const question = batch[index]!;
+				const options = normalizeOptions(question.options);
+				const progressCurrent = baseProgress + index;
+				setActiveBatchProgress({ current: progressCurrent, total: totalProgress });
 
-				function getDisplayProgress(): { current: number; total: number; reviewingHistory: boolean } {
-					const reviewingHistory = pageIndex < firstNewIndex;
-					const offset = activeProgressPageIndex - firstNewIndex;
+				const selectedLabel = await ctx.ui.select(
+					`Question ${progressCurrent}/${totalProgress}: ${question.question.trim()}`,
+					options,
+				);
+				if (selectedLabel === undefined) {
+					exitConvo(ctx, "Exited convo mode.");
 					return {
-						current: baseProgress + offset,
-						total: totalProgress,
-						reviewingHistory,
+						content: [{ type: "text", text: "User exited convo mode. Stop asking clarification questions." }],
+						details: {
+							cancelled: true,
+							exited: true,
+							answers: state.answers,
+						} satisfies ConvoBatchResultDetails,
 					};
 				}
 
-				const editorTheme: EditorTheme = {
-					borderColor: (s) => theme.fg("accent", s),
-					selectList: {
-						selectedPrefix: (s) => theme.fg("accent", s),
-						selectedText: (s) => theme.fg("accent", s),
-						description: (s) => theme.fg("muted", s),
-						scrollInfo: (s) => theme.fg("dim", s),
-						noMatch: (s) => theme.fg("warning", s),
-					},
-				};
-				const editor = new Editor(tui, editorTheme);
-				editor.disableSubmit = true;
-				editor.onChange = (text) => {
-					pages[pageIndex]!.note = text;
-					refresh();
-				};
+				const selectedIndex = Math.max(0, options.indexOf(selectedLabel));
+				const note = await ctx.ui.input(
+					`Additional context for question ${progressCurrent}/${totalProgress} (optional):`,
+					"Leave blank to continue"
+				);
 
-				function refresh(): void {
-					cachedLines = undefined;
-					tui.requestRender();
-				}
-
-				function currentPage(): ConvoAnswer {
-					return pages[pageIndex]!;
-				}
-
-				function syncEditor(): void {
-					editor.setText(currentPage().note);
-					optionIndex = clamp(currentPage().selectedIndex, 0, currentPage().options.length - 1);
-				}
-
-				function saveSelection(): void {
-					const page = currentPage();
-					page.selectedIndex = optionIndex;
-					page.selectedLabel = page.options[optionIndex]!;
-					page.note = editor.getText();
-				}
-
-				function goToPage(nextIndex: number): void {
-					const next = clamp(nextIndex, 0, pages.length - 1);
-					if (next === pageIndex) return;
-					saveSelection();
-					pageIndex = next;
-					if (pageIndex >= firstNewIndex) activeProgressPageIndex = pageIndex;
-					noteMode = false;
-					syncEditor();
-					const progress = getDisplayProgress();
-					setActiveBatchProgress({ current: progress.current, total: progress.total });
-					refresh();
-				}
-
-				function nextQuestionOrDone(): void {
-					saveSelection();
-					if (pageIndex < pages.length - 1) {
-						pageIndex += 1;
-						if (pageIndex >= firstNewIndex) activeProgressPageIndex = pageIndex;
-						noteMode = false;
-						syncEditor();
-						const progress = getDisplayProgress();
-						setActiveBatchProgress({ current: progress.current, total: progress.total });
-						refresh();
-						return;
-					}
-					done({
-						cancelled: false,
-						exited: false,
-						current: { ...currentPage() },
-						answers: pages.map((page) => ({ ...page })),
-					});
-				}
-
-				syncEditor();
-
-				return {
-					invalidate() {
-						cachedLines = undefined;
-					},
-
-					handleInput(data: string) {
-						if (matchesKey(data, "ctrl+c")) {
-							done({ cancelled: true, exited: true, answers: state.answers });
-							return;
-						}
-
-						if (noteMode) {
-							if (matchesKey(data, "escape")) {
-								saveSelection();
-								noteMode = false;
-								refresh();
-								return;
-							}
-							if (matchesKey(data, "enter")) {
-								nextQuestionOrDone();
-								return;
-							}
-							editor.handleInput(data);
-							currentPage().note = editor.getText();
-							refresh();
-							return;
-						}
-
-						if (matchesKey(data, "left")) {
-							goToPage(pageIndex - 1);
-							return;
-						}
-						if (matchesKey(data, "right")) {
-							goToPage(pageIndex + 1);
-							return;
-						}
-						if (matchesKey(data, "up") || matchesKey(data, "ctrl+p")) {
-							optionIndex = clamp(optionIndex - 1, 0, currentPage().options.length - 1);
-							refresh();
-							return;
-						}
-						if (matchesKey(data, "down") || matchesKey(data, "ctrl+n")) {
-							optionIndex = clamp(optionIndex + 1, 0, currentPage().options.length - 1);
-							refresh();
-							return;
-						}
-						if (matchesKey(data, "tab")) {
-							saveSelection();
-							noteMode = true;
-							syncEditor();
-							refresh();
-							return;
-						}
-						if (matchesKey(data, "enter")) {
-							nextQuestionOrDone();
-						}
-					},
-
-					render(width: number): string[] {
-						if (cachedLines) return cachedLines;
-
-						const page = currentPage();
-						const progress = getDisplayProgress();
-						const lines: string[] = [];
-						const add = (line: string) => lines.push(truncateToWidth(line, width));
-
-						add(theme.fg("accent", "─".repeat(width)));
-						add(theme.fg("accent", ` Question ${progress.current}/${progress.total}`));
-						if (pages.length > 1) {
-							const reviewLabel = progress.reviewingHistory
-								? ` Reviewing earlier answer ${pageIndex + 1}/${pages.length} • ← previous • → next`
-								: ` Review ${pageIndex + 1}/${pages.length} • ← previous • → next`;
-							add(theme.fg("dim", reviewLabel));
-						}
-						lines.push("");
-						add(theme.fg("text", ` ${page.question}`));
-						lines.push("");
-
-						for (let i = 0; i < page.options.length; i++) {
-							const isCursor = i === optionIndex;
-							const isSaved = i === page.selectedIndex;
-							const prefix = isCursor ? theme.fg("accent", "> ") : "  ";
-							const bullet = isSaved ? theme.fg("success", "●") : theme.fg("dim", "○");
-							const text = `${i + 1}. ${page.options[i]}`;
-							add(`${prefix}${bullet} ${isCursor ? theme.fg("accent", text) : theme.fg("text", text)}`);
-						}
-
-						lines.push("");
-						add(noteMode ? theme.fg("accent", " Additional context") : theme.fg("muted", " Additional context (Tab to edit)"));
-						if (noteMode) {
-							for (const line of editor.render(Math.max(10, width - 2))) {
-								add(` ${line}`);
-							}
-						} else if (page.note.trim()) {
-							for (const line of page.note.split("\n")) {
-								add(` ${theme.fg("text", line || " ")}`);
-							}
-						} else {
-							add(theme.fg("dim", "   No extra context"));
-						}
-
-						lines.push("");
-						add(theme.fg("dim", " ↑↓ or Ctrl+P/Ctrl+N choose • Tab context • Enter next • Esc leave note • Ctrl+C exit"));
-						add(theme.fg("accent", "─".repeat(width)));
-
-						cachedLines = lines;
-						return lines;
-					},
-				};
-			});
-
-			if (result.exited) {
-				exitConvo(ctx, "Exited convo mode.");
-				return {
-					content: [{ type: "text", text: "User exited convo mode. Stop asking clarification questions." }],
-					details: result,
-				};
+				const answer = sanitizeAnswer({
+					id: question.id?.trim() || `convo-${history.length + index + 1}-${Date.now()}-${index}`,
+					question: question.question.trim(),
+					options,
+					selectedIndex,
+					selectedLabel: options[selectedIndex] ?? selectedLabel,
+					note: note?.trim() ?? "",
+					progressCurrent,
+					progressTotal: totalProgress,
+				});
+				answers.push(answer);
+				current = answer;
 			}
 
-			const answers = result.answers.map((answer) => sanitizeAnswer(answer));
-			const current = result.current ? sanitizeAnswer(result.current) : answers[answers.length - 1];
 			state = {
 				...state,
 				answers,
