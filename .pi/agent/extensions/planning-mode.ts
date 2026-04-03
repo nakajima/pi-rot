@@ -226,6 +226,13 @@ export default function planningModeExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerShortcut("shift+tab", {
+		description: "Toggle planning mode",
+		handler: async (ctx) => {
+			setPlanningMode(!state.active, ctx);
+		},
+	});
+
 	pi.registerTool({
 		name: "request_planning_mode_exit",
 		label: "Request planning mode exit",
