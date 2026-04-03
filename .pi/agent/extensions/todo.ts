@@ -53,6 +53,35 @@ async function appendTodo(path: string, body: string): Promise<"created" | "appe
 	return "appended";
 }
 
+const DELETE_PREFIX = "   delete";
+
+function buildSelectLabels(items: string[]): string[] {
+	const labels: string[] = [];
+	for (let i = 0; i < items.length; i++) {
+		labels.push(`${i + 1}. ${items[i]}`);
+		labels.push(DELETE_PREFIX);
+	}
+	return labels;
+}
+
+function isDeleteLabel(label: string): boolean {
+	return label === DELETE_PREFIX;
+}
+
+function itemIndexFromDeleteLabel(labels: string[], selectedIndex: number): number {
+	return Math.floor(selectedIndex / 2);
+}
+
+async function removeTodoItem(path: string, items: string[], indexToRemove: number): Promise<string[]> {
+	const remaining = items.filter((_, i) => i !== indexToRemove);
+	if (remaining.length === 0) {
+		await writeFile(path, "", "utf8");
+	} else {
+		await writeFile(path, remaining.join("\n") + "\n", "utf8");
+	}
+	return remaining;
+}
+
 async function startTodoSession(pi: ExtensionAPI, ctx: ExtensionCommandContext, todoText: string): Promise<void> {
 	if (!ctx.isIdle()) {
 		ctx.ui.notify("Waiting for the current work to finish...", "info");
@@ -101,23 +130,41 @@ export default function todoExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			const menuItems = items.map((item, index) => ({
-				label: `${index + 1}. ${item}`,
-				value: item,
-			}));
-			const selectedLabel = await ctx.ui.select(
-				`Start a new session from ${TODO_FILENAME}`,
-				menuItems.map((item) => item.label),
-			);
-			if (!selectedLabel) return;
+			let currentItems = items;
 
-			const selected = menuItems.find((item) => item.label === selectedLabel);
-			if (!selected) {
-				ctx.ui.notify("Couldn't resolve the selected todo item.", "error");
+			while (currentItems.length > 0) {
+				const labels = buildSelectLabels(currentItems);
+				const selectedLabel = await ctx.ui.select(
+					`Start a new session from ${TODO_FILENAME}`,
+					labels,
+				);
+				if (!selectedLabel) return;
+
+				const selectedIndex = labels.indexOf(selectedLabel);
+				if (selectedIndex === -1) {
+					ctx.ui.notify("Couldn't resolve the selected todo item.", "error");
+					return;
+				}
+
+				if (isDeleteLabel(selectedLabel)) {
+					const itemIndex = itemIndexFromDeleteLabel(labels, selectedIndex);
+					const itemText = currentItems[itemIndex];
+					const confirmed = await ctx.ui.confirm(`Delete "${itemText}"?`);
+					if (confirmed) {
+						currentItems = await removeTodoItem(todoPath, currentItems, itemIndex);
+						if (currentItems.length === 0) {
+							ctx.ui.notify(`${TODO_FILENAME} is now empty.`, "info");
+							return;
+						}
+					}
+					continue;
+				}
+
+				// Selected a todo item — start a session
+				const itemIndex = Math.floor(selectedIndex / 2);
+				await startTodoSession(pi, ctx, currentItems[itemIndex]);
 				return;
 			}
-
-			await startTodoSession(pi, ctx, selected.value);
 		},
 	});
 }
