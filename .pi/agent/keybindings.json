@@ -18,6 +18,7 @@
   "app.model.cycleForward": [
     "alt+ctrl+p"
   ],
+  "app.thinking.cycle": [],
   "app.session.toggleNamedFilter": [
     "alt+ctrl+n"
   ],
