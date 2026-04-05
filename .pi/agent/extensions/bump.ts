@@ -284,14 +284,14 @@ async function chooseManifest(
 	ctx: ExtensionCommandContext,
 	repoRoot: string,
 	parsedArgs: ParsedArgs,
-): Promise<ManifestInfo> {
+): Promise<ManifestInfo | undefined> {
 	if (parsedArgs.manifestPath) {
 		const resolved = await resolveManifestPath(parsedArgs.manifestPath, repoRoot, ctx.cwd);
 		return readManifestInfo(resolved, repoRoot);
 	}
 
 	const candidates = await listManifestCandidates(pi, repoRoot);
-	if (candidates.length === 0) throw new Error("No package.json or Cargo.toml found in the repository.");
+	if (candidates.length === 0) return undefined;
 	if (candidates.length === 1) return readManifestInfo(join(repoRoot, candidates[0]!), repoRoot);
 
 	const rootCandidates = candidates.filter((candidate) => !candidate.includes("/"));
@@ -528,15 +528,20 @@ async function resolveCommitMessageModel(ctx: ExtensionCommandContext): Promise<
 
 async function proposeCommitMessage(
 	ctx: ExtensionCommandContext,
-	manifest: ManifestInfo,
-	nextVersion: string,
 	diff: string,
+	manifest?: ManifestInfo,
+	nextVersion?: string,
 ): Promise<string> {
-	const fallback = normalizeCommitMessage(`Update ${manifest.name || manifest.relativePath} and bump to ${nextVersion}`);
+	const fallback = manifest && nextVersion
+		? normalizeCommitMessage(`Update ${manifest.name || manifest.relativePath} and bump to ${nextVersion}`)
+		: "Update files";
 	const selection = await resolveCommitMessageModel(ctx);
 	if (!selection) return fallback;
 
 	const truncated = diff.length > 20_000 ? `${diff.slice(0, 20_000)}\n... (truncated)` : diff;
+	const contextLines: string[] = [];
+	if (nextVersion) contextLines.push(`Target version: ${nextVersion}`);
+	if (manifest) contextLines.push(manifest.name ? `Package name: ${manifest.name}` : `Manifest: ${manifest.relativePath}`);
 	try {
 		ctx.ui.notify(
 			`Drafting commit message with ${selection.model.provider}/${selection.model.id} (${selection.source})...`,
@@ -555,13 +560,12 @@ async function proposeCommitMessage(
 								"Requirements:",
 								"- imperative mood",
 								"- max 72 characters if possible",
-								"- mention the version bump when relevant",
+								nextVersion ? "- mention the version bump when relevant" : "",
 								"- no markdown, no quotes, no body, just the subject line",
-								`Target version: ${nextVersion}`,
-								manifest.name ? `Package name: ${manifest.name}` : `Manifest: ${manifest.relativePath}`,
+								...contextLines,
 								"",
 								truncated,
-							].join("\n"),
+							].filter(Boolean).join("\n"),
 						}],
 						timestamp: Date.now(),
 					},
@@ -638,28 +642,35 @@ export default function bumpExtension(pi: ExtensionAPI) {
 				}
 
 				const manifest = await chooseManifest(pi, ctx, repoRoot, parsedArgs);
-				const nextVersion = computeNextVersion(manifest.version, parsedArgs);
-				if (nextVersion === manifest.version) {
-					throw new Error(`${manifest.relativePath} is already at ${nextVersion}.`);
-				}
 
-				if (ctx.hasUI) {
-					const confirmed = await ctx.ui.confirm(
-						"Confirm bump",
-						`${manifest.name || manifest.relativePath}\n\n${manifest.version} → ${nextVersion}\n\nThis will update the manifest, refresh lockfiles/checks, propose a commit message, commit, and push.`,
-					);
-					if (!confirmed) {
-						ctx.ui.notify("Bump cancelled.", "info");
-						return;
+				let nextVersion: string | undefined;
+				if (manifest) {
+					nextVersion = computeNextVersion(manifest.version, parsedArgs);
+					if (nextVersion === manifest.version) {
+						throw new Error(`${manifest.relativePath} is already at ${nextVersion}.`);
 					}
+
+					if (ctx.hasUI) {
+						const confirmed = await ctx.ui.confirm(
+							"Confirm bump",
+							`${manifest.name || manifest.relativePath}\n\n${manifest.version} → ${nextVersion}\n\nThis will update the manifest, refresh lockfiles/checks, propose a commit message, commit, and push.`,
+						);
+						if (!confirmed) {
+							ctx.ui.notify("Bump cancelled.", "info");
+							return;
+						}
+					}
+
+					await writeManifestVersion(manifest, nextVersion);
+					ctx.ui.notify(`Updated ${manifest.relativePath}: ${manifest.version} → ${nextVersion}`, "info");
+					await runManifestSync(pi, manifest, repoRoot, ctx);
+				} else {
+					ctx.ui.notify("No manifest found, committing and pushing changes as-is.", "info");
 				}
 
-				await writeManifestVersion(manifest, nextVersion);
-				ctx.ui.notify(`Updated ${manifest.relativePath}: ${manifest.version} → ${nextVersion}`, "info");
-				await runManifestSync(pi, manifest, repoRoot, ctx);
 				const staged = await stageAllChanges(pi, repoRoot);
 				const stagedDiff = await getStagedDiff(pi, repoRoot);
-				const proposedMessage = await proposeCommitMessage(ctx, manifest, nextVersion, stagedDiff);
+				const proposedMessage = await proposeCommitMessage(ctx, stagedDiff, manifest, nextVersion);
 				const commitMessage = await chooseCommitMessage(ctx, proposedMessage, staged);
 				await commitAndPush(pi, ctx, repoRoot, commitMessage);
 				ctx.ui.notify(`Committed and pushed ${staged.length} file${staged.length === 1 ? "" : "s"}.`, "info");
