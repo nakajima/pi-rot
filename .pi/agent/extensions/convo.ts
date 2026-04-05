@@ -714,6 +714,7 @@ function getSummarySectionLines(text: string, targetHeading: (typeof SUMMARY_HEA
 	let collecting = false;
 
 	for (const line of lines) {
+		if (collecting && line.trim() === COMPLETE_MARKER) break;
 		const parsed = parseSummaryHeading(line);
 		if (parsed) {
 			if (collecting && parsed.heading !== targetHeading) break;
@@ -749,6 +750,10 @@ function hasUnresolvedOpenQuestions(text: string): boolean {
 		.filter((line) => line.length > 0 && line !== COMPLETE_MARKER);
 
 	if (lines.length === 0) return false;
+	// If the first content line resolves (e.g. "None", "N/A"), the section is
+	// closed. Any trailing commentary the model adds after that shouldn't
+	// reopen it.
+	if (isResolvedOpenQuestionLine(lines[0]!)) return false;
 	return lines.some((line) => !isResolvedOpenQuestionLine(line));
 }
 
