@@ -1,6 +1,6 @@
 {
   "name": "pimux2000-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "bin": {
     "pimux2000": "./src/cli.ts"
