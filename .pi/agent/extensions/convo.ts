@@ -44,9 +44,18 @@ interface ConvoBatchResultDetails {
 	current?: ConvoAnswer;
 }
 
+type ConvoDirectiveMode = "start" | "continue" | "implement";
+
+interface ConvoDirectiveDetails {
+	mode: ConvoDirectiveMode;
+	sourceLabel?: string;
+}
+
 const STATE_ENTRY = "convo-state";
 const STATUS_ID = "convo-mode";
 const WIDGET_ID = "convo-mode";
+const DIRECTIVE_MESSAGE_TYPE = "convo-directive";
+const DIRECTIVE_PREFIX = "[CONVO EXTENSION DIRECTIVE — NOT A USER MESSAGE]";
 const COMPLETE_MARKER = "[CONVO_COMPLETE]";
 const FALLBACK_OPTION = "None of these / something else";
 const SESSION_CONTEXT_SEED = "Use the existing session context so far.";
@@ -237,6 +246,11 @@ function normalizeWhitespace(text: string): string {
 function truncateText(text: string, maxLength: number): string {
 	const normalized = normalizeWhitespace(text);
 	return normalized.length > maxLength ? `${normalized.slice(0, Math.max(1, maxLength - 3))}...` : normalized;
+}
+
+function stripConvoDirectivePrefix(text: string): string {
+	const trimmed = text.trim();
+	return trimmed.startsWith(DIRECTIVE_PREFIX) ? trimmed.slice(DIRECTIVE_PREFIX.length).trim() : trimmed;
 }
 
 function isInternalConvoMessage(text: string): boolean {
@@ -780,21 +794,14 @@ function looksInsufficientContext(text: string): boolean {
 	].some((phrase) => normalized.includes(phrase));
 }
 
+function countConcreteQuestions(text: string): number {
+	return (text.match(/\b(what|which|where|when|why|how|who|should|do|does|did|is|are|can|could|would|will|prefer)\b[^?]{0,180}\?/gi) ?? []).length;
+}
+
 function looksLikeClarificationRequest(text: string): boolean {
 	const normalized = text.toLowerCase();
-	return CLARIFICATION_REQUEST_PHRASES.some((phrase) => normalized.includes(phrase)) || text.includes("?");
-}
-
-function countQuestionMarks(text: string): number {
-	return (text.match(/\?/g) ?? []).length;
-}
-
-function shouldAutoEnterConvo(text: string): boolean {
-	const normalized = text.toLowerCase();
 	if (CLARIFICATION_REQUEST_PHRASES.some((phrase) => normalized.includes(phrase))) return true;
-	if (looksInsufficientContext(text)) return true;
-	if (/\b(what|which|where|when|why|how|should)\b.+\?/i.test(text) && countQuestionMarks(text) >= 2) return true;
-	return false;
+	return countConcreteQuestions(text) >= 2;
 }
 
 export default function convoExtension(pi: ExtensionAPI) {
@@ -808,8 +815,64 @@ export default function convoExtension(pi: ExtensionAPI) {
 	};
 	let usedQuestionnaireThisAgentRun = false;
 
+	pi.registerMessageRenderer(DIRECTIVE_MESSAGE_TYPE, (message, _options, theme) => {
+		const details = message.details as ConvoDirectiveDetails | undefined;
+		const modeLabel =
+			details?.mode === "implement"
+				? "CONVO → IMPLEMENT"
+				: details?.mode === "start"
+					? "CONVO START"
+					: "CONVO DIRECTIVE";
+		const body = typeof message.content === "string" ? stripConvoDirectivePrefix(message.content) : "";
+		const lines = [
+			`${theme.fg("accent", theme.bold(`[${modeLabel}]`))} ${theme.fg("warning", "not a user message")}`,
+		];
+		if (body) lines.push(body);
+		return new Text(lines.join("\n"), 0, 0);
+	});
+
 	function persistState(): void {
 		pi.appendEntry(STATE_ENTRY, { ...state });
+	}
+
+	function sendConvoDirective(
+		instruction: string,
+		options?: {
+			mode?: ConvoDirectiveMode;
+			sourceLabel?: string;
+			contextBlocks?: Array<{ label: string; text?: string }>;
+			deliverAs?: "steer" | "followUp" | "nextTurn";
+			triggerTurn?: boolean;
+		},
+	): void {
+		const sections = [DIRECTIVE_PREFIX];
+		if (options?.sourceLabel?.trim()) sections.push(`Source:\n${options.sourceLabel.trim()}`);
+		for (const block of options?.contextBlocks ?? []) {
+			const text = block.text?.trim();
+			if (!text) continue;
+			sections.push(`${block.label}:\n${text}`);
+		}
+		sections.push(`Instruction:\n${instruction.trim()}`);
+
+		const sendOptions: {
+			deliverAs?: "steer" | "followUp" | "nextTurn";
+			triggerTurn?: boolean;
+		} = {};
+		if (options?.deliverAs) sendOptions.deliverAs = options.deliverAs;
+		if (options?.triggerTurn === true) sendOptions.triggerTurn = true;
+
+		pi.sendMessage(
+			{
+				customType: DIRECTIVE_MESSAGE_TYPE,
+				content: sections.join("\n\n"),
+				display: true,
+				details: {
+					mode: options?.mode ?? "continue",
+					sourceLabel: options?.sourceLabel?.trim() || undefined,
+				} satisfies ConvoDirectiveDetails,
+			},
+			sendOptions,
+		);
 	}
 
 	function updateUI(ctx: ExtensionContext): void {
@@ -955,9 +1018,14 @@ export default function convoExtension(pi: ExtensionAPI) {
 				exitConvo(ctx, "Convo mode complete.");
 				return;
 			}
-			pi.sendUserMessage(
-				"You are still in /convo discovery mode. Do not stop without a next step. Either call convo_questionnaire with the next batch of highest-value clarification questions, or if the work is already clear enough, produce the final summary with Goal, Requirements, Constraints, Assumptions, Implementation plan, and Open questions: None, ending with [CONVO_COMPLETE].",
-				{ deliverAs: "followUp" },
+			sendConvoDirective(
+				"You are still in /convo discovery mode. Do not stop without a next step. If more information is genuinely blocking, call convo_questionnaire with only the top 1-2 concrete questions needed to proceed and make each question identify the missing decision it affects. Otherwise resolve the gaps with reasonable assumptions, produce the final summary with Goal, Requirements, Constraints, Assumptions, Implementation plan, and Open questions: None, and end with [CONVO_COMPLETE].",
+				{
+					mode: "continue",
+					sourceLabel: "convo extension follow-up",
+					deliverAs: "followUp",
+					triggerTurn: true,
+				},
 			);
 			return;
 		}
@@ -969,7 +1037,12 @@ export default function convoExtension(pi: ExtensionAPI) {
 
 		if (choice === "Start implementing") {
 			exitConvo(ctx, "Exited convo mode. Starting implementation.");
-			pi.sendUserMessage("Start implementing based on the agreed summary and implementation plan.");
+			sendConvoDirective("Start implementing based on the agreed summary and implementation plan.", {
+				mode: "implement",
+				sourceLabel: 'user selected "Start implementing" in convo UI',
+				deliverAs: "followUp",
+				triggerTurn: true,
+			});
 			return;
 		}
 
@@ -977,25 +1050,19 @@ export default function convoExtension(pi: ExtensionAPI) {
 			const userNote = await ctx.ui.input("Additional direction (optional):", "e.g. focus on the database schema");
 			const baseMessage =
 				mode === "complete"
-					? "Keep planning this. Stay in convo mode. Either ask the next batch of highest-value clarification questions using convo_questionnaire, or revise the plan if more refinement is needed."
-					: "You are still in /convo discovery mode. Do not stop without a next step. Either call convo_questionnaire with the next batch of highest-value clarification questions, or if the work is already clear enough, produce the final summary with Goal, Requirements, Constraints, Assumptions, Implementation plan, and Open questions: None, ending with [CONVO_COMPLETE].";
-			const message = userNote?.trim()
-				? `Keep planning. User direction: ${userNote.trim()}\n\n${baseMessage}`
-				: baseMessage;
-			pi.sendUserMessage(message, { deliverAs: "followUp" });
+					? "Keep planning this. Stay in convo mode. If more information is genuinely blocking, ask only the top 1-2 concrete clarification questions using convo_questionnaire. Otherwise revise the plan with reasonable assumptions and keep the summary concrete."
+					: "You are still in /convo discovery mode. Do not stop without a next step. If more information is genuinely blocking, call convo_questionnaire with only the top 1-2 concrete questions needed to proceed and make each question identify the missing decision it affects. Otherwise resolve the gaps with reasonable assumptions, produce the final summary with Goal, Requirements, Constraints, Assumptions, Implementation plan, and Open questions: None, and end with [CONVO_COMPLETE].";
+			sendConvoDirective(baseMessage, {
+				mode: "continue",
+				sourceLabel: 'user selected "Keep Planning" in convo UI',
+				contextBlocks: [{ label: "User note from convo UI", text: userNote?.trim() }],
+				deliverAs: "followUp",
+				triggerTurn: true,
+			});
 			return;
 		}
 
 		exitConvo(ctx, "Exited convo mode.");
-	}
-
-	async function autoEnterConvoFromContext(ctx: ExtensionContext, options?: { reason?: string }): Promise<boolean> {
-		if (state.active || !hasMeaningfulSessionContext(ctx)) return false;
-		const seed = deriveSessionSeed(ctx);
-		const preflight = await buildConvoPreflight(seed, ctx, { useExistingContext: true });
-		enterConvo(seed, ctx, { useExistingContext: true, preflight });
-		if (ctx.hasUI) ctx.ui.notify(options?.reason || "Pi needs a few answers before it can proceed. Switched to convo mode.", "info");
-		return true;
 	}
 
 	function installEditor(_ctx: ExtensionContext): void {}
@@ -1023,11 +1090,15 @@ export default function convoExtension(pi: ExtensionAPI) {
 			enterConvo(seed, ctx, { useExistingContext: usingExistingContext, preflight });
 			const prompt = usingExistingContext
 				? "Let's work this out together before implementation using the existing session context so far. Use the preflight context you already have. If there still isn't enough context to proceed, say so plainly."
-				: `Let's work this out together before implementation.\n\nIdea:\n${idea}\n\nUse the preflight context you already have before asking questions.`;
-			if (ctx.isIdle()) {
-				pi.sendUserMessage(prompt);
-			} else {
-				pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+				: "Let's work this out together before implementation. Use the preflight context you already have before asking questions.";
+			sendConvoDirective(prompt, {
+				mode: "start",
+				sourceLabel: usingExistingContext ? "user invoked /convo using existing session context" : "user invoked /convo with a seed idea",
+				contextBlocks: usingExistingContext ? [] : [{ label: "User-provided /convo idea", text: idea }],
+				deliverAs: "followUp",
+				triggerTurn: true,
+			});
+			if (!ctx.isIdle()) {
 				ctx.ui.notify("Queued convo to start after the current work finishes.", "info");
 			}
 		},
@@ -1043,6 +1114,9 @@ export default function convoExtension(pi: ExtensionAPI) {
 			"During /convo mode, ask clarifying questions with convo_questionnaire instead of plain text.",
 			"Provide a batch of high-value questions so the user can answer locally without waiting between questions.",
 			"Prefer the top 1-2 missing questions over a long generic list unless the context is still very unclear.",
+			"Each question must target a specific missing decision and should make clear what implementation choice it affects.",
+			"Prefer concrete questions about files, APIs, behavior, data shape, migrations, naming, or ownership over high-level strategy questions.",
+			"If a reasonable default exists, assume it and record it in the summary instead of asking a vague question.",
 			"For each question, provide three to five concrete options, and when showing directions keep them adaptive to the request.",
 		],
 		parameters: ConvoQuestionnaireParams,
@@ -1245,7 +1319,7 @@ export default function convoExtension(pi: ExtensionAPI) {
 		return {
 			systemPrompt:
 				event.systemPrompt +
-				`\n\n[CONVO MODE]\nYou are in collaborative requirements-discovery mode.\n\n${seedContext}${preflightContext}\n\nRules:\n- Work out the idea with the user before implementation.\n- Use the preflight context above before asking questions. Do not ignore it and do not begin with generic discovery questions when the preflight already narrows the task.\n- Ask follow-up questions with the convo_questionnaire tool, not with plain chat text.\n- If you still need clarification after sharing repo findings or an interim summary, do not stop there. Immediately either call convo_questionnaire with the next batch or produce the final summary if the work is already clear enough.\n- Use the tool to ask a local batch of high-value questions so the user does not wait on an LLM round-trip between each answer.\n- Each question in the batch should have three to five concrete options.\n- The tool result includes the complete structured answer history; use it instead of re-asking answered questions.\n- Ask as many questions as needed to make the project concrete, but prefer fewer, better batches.\n- Prefer the top 1-2 highest-value missing questions over a long generic list.\n- If you present likely directions, make them adaptive to the request and include a clear 'None of these / something else' escape hatch.\n- Recommended opening move for this convo: ${recommendedOpen}\n- If confidence is high and the request is explicit with strong repo evidence, you may skip questions and move straight to a concrete summary/plan.\n- Periodically summarize your current understanding in plain language.\n- Do not start coding, editing files, or writing implementation output unless the user clearly wants to move beyond discovery.\n- Once the work is clear enough, stop asking questions and produce a concise summary with: Goal, Requirements, Constraints, Assumptions, Implementation plan, and Open questions.\n- Do not finish with unresolved items under Open questions. Either resolve them via reasonable assumptions and document those assumptions, or ask another batch of clarification questions.\n- Only mark the convo complete when Open questions is explicitly None, N/A, or no open questions.\n- When you reach that point, include the exact line ${COMPLETE_MARKER} at the very end of the response.`,
+				`\n\n[CONVO MODE]\nYou are in collaborative requirements-discovery mode.\n\n${seedContext}${preflightContext}\n\nRules:\n- Work out the idea with the user before implementation.\n- Use the preflight context above before asking questions. Do not ignore it and do not begin with generic discovery questions when the preflight already narrows the task.\n- Ask follow-up questions with the convo_questionnaire tool, not with plain chat text.\n- Only ask a question when the answer would materially change the implementation.\n- Each question must name the specific missing decision and what part of the implementation it affects.\n- Prefer concrete questions about files, APIs, behavior, data shape, migrations, naming, or ownership over high-level strategy questions.\n- If a reasonable default exists, assume it and record it under Assumptions instead of asking a vague question.\n- Do not ask broad direction-setting questions when the request is already narrowed by the user prompt and preflight context.\n- If you still need clarification after sharing repo findings or an interim summary, do not stop there. Immediately either call convo_questionnaire with the next batch or produce the final summary if the work is already clear enough.\n- Use the tool to ask a local batch of high-value questions so the user does not wait on an LLM round-trip between each answer.\n- Each question in the batch should have three to five concrete options.\n- The tool result includes the complete structured answer history; use it instead of re-asking answered questions.\n- Ask as many questions as needed to make the project concrete, but prefer fewer, better batches.\n- Prefer the top 1-2 highest-value missing questions over a long generic list.\n- If you present likely directions, make them adaptive to the request and include a clear 'None of these / something else' escape hatch.\n- Recommended opening move for this convo: ${recommendedOpen}\n- If confidence is high and the request is explicit with strong repo evidence, you may skip questions and move straight to a concrete summary/plan.\n- Periodically summarize your current understanding in plain language.\n- Do not start coding, editing files, or writing implementation output unless the user clearly wants to move beyond discovery.\n- Once the work is clear enough, stop asking questions and produce a concise summary with: Goal, Requirements, Constraints, Assumptions, Implementation plan, and Open questions.\n- If there are no blocking open questions, explicitly write Open questions: None even if minor nice-to-have follow-ups remain.\n- Do not finish with unresolved blocking items under Open questions. Either resolve them via reasonable assumptions and document those assumptions, or ask another batch of clarification questions.\n- When you reach that point, include the exact line ${COMPLETE_MARKER} at the very end of the response.`,
 		};
 	});
 
@@ -1257,15 +1331,9 @@ export default function convoExtension(pi: ExtensionAPI) {
 		}
 
 		if (!state.active) {
-			if (!ctx.hasUI || !shouldAutoEnterConvo(text)) return;
-			const entered = await autoEnterConvoFromContext(ctx, {
-				reason: "Pi has follow-up questions. Switched to convo mode automatically.",
-			});
-			if (!entered) return;
-			pi.sendUserMessage(
-				"You need more information before you can continue. You are now in convo mode. Do not ask plain chat questions. Call convo_questionnaire with the next batch of highest-value clarification questions.",
-				{ deliverAs: "followUp" },
-			);
+			if (ctx.hasUI && (looksInsufficientContext(text) || looksLikeClarificationRequest(text))) {
+				ctx.ui.notify("Pi has follow-up questions. Use /convo if you want a structured questionnaire instead of plain chat.", "info");
+			}
 			return;
 		}
 
@@ -1277,32 +1345,42 @@ export default function convoExtension(pi: ExtensionAPI) {
 		if (hasSummaryShape(text) && hasUnresolvedOpenQuestions(text)) {
 			state = { ...state, questionnaireRetryCount: 0 };
 			persistState();
-			if (ctx.hasUI) ctx.ui.notify("Convo summary still has open questions. Continuing refinement.", "info");
-			pi.sendUserMessage(
-				"Your last summary still listed unresolved open questions. Convo is not complete until Open questions is None. Ask the next batch of highest-value clarification questions using convo_questionnaire, or resolve the gaps with reasonable assumptions and update the summary.",
-				{ deliverAs: "followUp" },
+			if (ctx.hasUI) {
+				ctx.ui.notify("Convo summary still has blocking open questions. Choose whether to keep refining or leave convo.", "info");
+				await promptForNextConvoStep(ctx, "incomplete");
+				return;
+			}
+			sendConvoDirective(
+				"You are still in /convo discovery mode. If more information is genuinely blocking, call convo_questionnaire with only the top 1-2 concrete questions needed to proceed. Otherwise resolve the gaps with reasonable assumptions, update the summary, and finish with Open questions: None.",
+				{
+					mode: "continue",
+					sourceLabel: "convo extension follow-up after summary with blocking open questions",
+					deliverAs: "followUp",
+					triggerTurn: true,
+				},
 			);
 			return;
 		}
 
 		if (!usedQuestionnaireThisAgentRun && looksLikeClarificationRequest(text)) {
-			const retryCount = state.questionnaireRetryCount ?? 0;
-			if (retryCount >= 1) {
-				if (ctx.hasUI) {
-					ctx.ui.notify(
-						"Convo still needs clarification, but no questionnaire was produced. Add more context or rerun /convo.",
-						"warning",
-					);
-				}
+			state = { ...state, questionnaireRetryCount: 0 };
+			persistState();
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					"Convo response still sounds like a prose clarification request. Choose whether to keep refining or leave convo.",
+					"info",
+				);
+				await promptForNextConvoStep(ctx, "incomplete");
 				return;
 			}
-
-			state = { ...state, questionnaireRetryCount: retryCount + 1 };
-			persistState();
-			if (ctx.hasUI) ctx.ui.notify("Convo needs clarification. Requesting a questionnaire.", "info");
-			pi.sendUserMessage(
-				"You still need more information. Do not stop with prose or plain chat questions. Call convo_questionnaire now with the next batch of highest-value clarification questions.",
-				{ deliverAs: "followUp" },
+			sendConvoDirective(
+				"You are still in /convo discovery mode. If more information is genuinely blocking, call convo_questionnaire with only the top 1-2 concrete questions needed to proceed. Otherwise make reasonable assumptions, update the summary, and finish with Open questions: None.",
+				{
+					mode: "continue",
+					sourceLabel: "convo extension follow-up after prose clarification request",
+					deliverAs: "followUp",
+					triggerTurn: true,
+				},
 			);
 			return;
 		}
