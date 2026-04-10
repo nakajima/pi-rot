@@ -3,6 +3,7 @@
 - If we're using an ORM of any kind, do not wrap the ORM objects in deeper levels of abstraction. Just use the ORM.
 - Prefer inaction over action. Don't just jump into writing code unless specifically instructed or the task is extremely simple.
 - do not add 3rd party dependencies without explicit confirmation
+- if you are choosing between expedience and correctness, always go with correctness.
 
 ## Candidate memories
 
