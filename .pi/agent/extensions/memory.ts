@@ -33,6 +33,10 @@ type StoredItem =
 
 const STORE_PATH = join(homedir(), ".pi", "agent", "memories.md");
 const LEGACY_STORE_PATH = join(homedir(), ".pi", "agent", "global-memories.json");
+const PIROT_REPO_DIR = join(homedir(), "apps", "pirot");
+const PIROT_MEMORIES_RELATIVE_PATH = join(".pi", "agent", "memories.md");
+const PIROT_MEMORIES_PATH = join(PIROT_REPO_DIR, PIROT_MEMORIES_RELATIVE_PATH);
+const PIROT_MEMORIES_SYNC_COMMIT_MESSAGE = "memories: update global preferences";
 const MEMORY_WARNING_BYTES = 4 * 1024;
 const MAX_CANDIDATE_SNIPPETS = 3;
 const CANDIDATE_PROMOTION_THRESHOLD = 3;
@@ -571,6 +575,101 @@ async function saveMemory(
 	return { status: "saved", memory };
 }
 
+function commandFailureMessage(stdout: string, stderr: string, fallback: string): string {
+	const message = (stderr || stdout || fallback).trim();
+	return message || fallback;
+}
+
+async function resolveRealPathOrSelf(path: string): Promise<string> {
+	try {
+		return await realpath(path);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException | undefined)?.code;
+		if (code === "ENOENT") {
+			return path;
+		}
+		throw error;
+	}
+}
+
+async function isPirotBackedMemoryStore(): Promise<boolean> {
+	const storeWritePath = await resolveStoreWritePath();
+	const pirotMemoriesPath = await resolveRealPathOrSelf(PIROT_MEMORIES_PATH);
+	return storeWritePath === pirotMemoriesPath;
+}
+
+async function syncPirotAfterRemember(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+	try {
+		if (!(await isPirotBackedMemoryStore())) {
+			return;
+		}
+
+		const repoCheckResult = await pi.exec("git", ["rev-parse", "--show-toplevel"], {
+			cwd: PIROT_REPO_DIR,
+			timeout: 10_000,
+		});
+		if (repoCheckResult.code !== 0) {
+			ctx.ui.notify(
+				`Saved memory, but pirot sync skipped: ${commandFailureMessage(repoCheckResult.stdout, repoCheckResult.stderr, "Unable to access pirot repo")}`,
+				"warning",
+			);
+			return;
+		}
+
+		const statusResult = await pi.exec("git", ["status", "--porcelain", "--", PIROT_MEMORIES_RELATIVE_PATH], {
+			cwd: PIROT_REPO_DIR,
+			timeout: 10_000,
+		});
+		if (statusResult.code !== 0) {
+			ctx.ui.notify(
+				`Saved memory, but pirot sync skipped: ${commandFailureMessage(statusResult.stdout, statusResult.stderr, "Unable to inspect pirot memory status")}`,
+				"warning",
+			);
+			return;
+		}
+		if (!statusResult.stdout.trim()) {
+			return;
+		}
+
+		ctx.ui.notify("Syncing pirot memories...", "info");
+
+		const commitResult = await pi.exec(
+			"git",
+			["commit", "-m", PIROT_MEMORIES_SYNC_COMMIT_MESSAGE, "--", PIROT_MEMORIES_RELATIVE_PATH],
+			{
+				cwd: PIROT_REPO_DIR,
+				timeout: 30_000,
+			},
+		);
+		if (commitResult.code !== 0) {
+			const message = commandFailureMessage(commitResult.stdout, commitResult.stderr, "git commit failed");
+			if (/nothing to commit/i.test(message)) {
+				ctx.ui.notify("Pirot memories were already up to date.", "info");
+				return;
+			}
+			ctx.ui.notify(`Saved memory, but pirot sync failed: ${message}`, "warning");
+			return;
+		}
+
+		const pushResult = await pi.exec("git", ["push"], {
+			cwd: PIROT_REPO_DIR,
+			timeout: 120_000,
+		});
+		if (pushResult.code !== 0) {
+			ctx.ui.notify(
+				`Saved memory and committed it locally, but pirot push failed: ${commandFailureMessage(pushResult.stdout, pushResult.stderr, "git push failed")}`,
+				"warning",
+			);
+			return;
+		}
+
+		ctx.ui.notify("Synced pirot memories.", "info");
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		ctx.ui.notify(`Saved memory, but pirot sync failed: ${message}`, "warning");
+	}
+}
+
 function scoreFuzzyMatch(query: string, text: string): number {
 	const normalizedQuery = normalizeForComparison(query);
 	const normalizedText = normalizeForComparison(text);
@@ -811,7 +910,10 @@ export default function memoryExtension(pi: ExtensionAPI) {
 				ctx.ui.notify("Usage: /remember <memory>", "warning");
 				return;
 			}
-			await saveMemory(text, { inferred: false }, ctx);
+			const result = await saveMemory(text, { inferred: false }, ctx);
+			if ((result.status === "saved" || result.status === "updated") && result.memory) {
+				await syncPirotAfterRemember(pi, ctx);
+			}
 		},
 	});
 
