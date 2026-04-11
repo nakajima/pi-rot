@@ -33,6 +33,29 @@ interface GitStatusEntry {
 	untracked: boolean;
 }
 
+interface BumpRunOptions {
+	skipConfirmations: boolean;
+}
+
+interface PreparedBumpRun {
+	repoRoot: string;
+	parsedArgs: ParsedArgs;
+	manifest?: ManifestInfo;
+	initialStatus: GitStatusEntry[];
+}
+
+interface BumpRunResult {
+	repoRoot: string;
+	manifest?: ManifestInfo;
+	nextVersion?: string;
+}
+
+interface ReleaseConfigInfo {
+	path: string;
+	relativePath: string;
+	cwd: string;
+}
+
 const VERSION_RE = /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const EXPLICIT_VERSION_RE = VERSION_RE;
 
@@ -62,7 +85,7 @@ async function pathExists(path: string): Promise<boolean> {
 	}
 }
 
-function parseArgs(args: string): ParsedArgs {
+function parseArgs(args: string, commandName: string = "bump"): ParsedArgs {
 	const tokens = args
 		.trim()
 		.split(/\s+/)
@@ -87,7 +110,7 @@ function parseArgs(args: string): ParsedArgs {
 			continue;
 		}
 
-		if (manifestPath) throw new Error("Too many arguments. Usage: /bump [patch|minor|major|x.y.z] [path]");
+		if (manifestPath) throw new Error(`Too many arguments. Usage: /${commandName}[!] [patch|minor|major|x.y.z] [path]`);
 		manifestPath = token;
 	}
 
@@ -317,6 +340,87 @@ async function chooseManifest(
 	return selected;
 }
 
+function toReleaseConfigInfo(path: string, repoRoot: string): ReleaseConfigInfo {
+	return {
+		path,
+		relativePath: normalizePath(relative(repoRoot, path)),
+		cwd: dirname(path),
+	};
+}
+
+async function listReleasorConfigCandidates(pi: ExtensionAPI, repoRoot: string): Promise<string[]> {
+	const result = await pi.exec("git", ["ls-files", "--cached", "--others", "--exclude-standard"], {
+		cwd: repoRoot,
+		timeout: 15_000,
+	});
+	if (result.code !== 0) {
+		throw new Error((result.stderr || result.stdout || "git ls-files failed").trim());
+	}
+
+	return (result.stdout || "")
+		.split(/\r?\n/)
+		.map((line) => normalizePath(line.trim()))
+		.filter(Boolean)
+		.filter((path) => basename(path) === "releasor2000.toml")
+		.sort((a, b) => a.localeCompare(b));
+}
+
+async function findNearestReleasorConfig(repoRoot: string, startDir: string): Promise<string | undefined> {
+	const normalizedRepoRoot = normalizePath(repoRoot);
+	let currentDir = resolve(startDir);
+
+	while (true) {
+		const normalizedCurrentDir = normalizePath(currentDir);
+		if (normalizedCurrentDir === normalizedRepoRoot || normalizedCurrentDir.startsWith(`${normalizedRepoRoot}/`)) {
+			const candidate = join(currentDir, "releasor2000.toml");
+			if (await pathExists(candidate)) return candidate;
+		}
+		if (normalizedCurrentDir === normalizedRepoRoot) return undefined;
+
+		const parent = dirname(currentDir);
+		if (parent === currentDir) return undefined;
+		currentDir = parent;
+	}
+}
+
+async function chooseReleasorConfig(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	repoRoot: string,
+	preferredStartDir: string,
+): Promise<ReleaseConfigInfo> {
+	const nearest = await findNearestReleasorConfig(repoRoot, preferredStartDir);
+	if (nearest) return toReleaseConfigInfo(nearest, repoRoot);
+
+	const candidates = await listReleasorConfigCandidates(pi, repoRoot);
+	if (candidates.length === 0) {
+		throw new Error("No releasor2000.toml found in this repository.");
+	}
+	if (candidates.length === 1) {
+		return toReleaseConfigInfo(join(repoRoot, candidates[0]!), repoRoot);
+	}
+
+	const rootCandidates = candidates.filter((candidate) => !candidate.includes("/"));
+	if (rootCandidates.length === 1) {
+		return toReleaseConfigInfo(join(repoRoot, rootCandidates[0]!), repoRoot);
+	}
+
+	if (!ctx.hasUI) {
+		throw new Error(`Multiple releasor2000.toml files found: ${candidates.join(", ")}. Re-run from the intended directory.`);
+	}
+
+	const options = candidates.map((candidate) => toReleaseConfigInfo(join(repoRoot, candidate), repoRoot));
+	const selection = await ctx.ui.select(
+		"Choose a releasor2000 config",
+		options.map((option) => option.relativePath),
+	);
+	if (!selection) throw new Error("Release cancelled.");
+
+	const selected = options.find((option) => option.relativePath === selection);
+	if (!selected) throw new Error("Could not resolve the selected releasor2000 config.");
+	return selected;
+}
+
 function updatePackageJsonVersion(raw: string, nextVersion: string): string {
 	const next = raw.replace(/("version"\s*:\s*")([^"]+)(")/, `$1${nextVersion}$3`);
 	if (next === raw) throw new Error("Could not update version in package.json.");
@@ -418,6 +522,10 @@ async function runManifestSync(pi: ExtensionAPI, manifest: ManifestInfo, repoRoo
 
 function normalizeCommitMessage(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
+}
+
+function isCancellationMessage(message: string): boolean {
+	return message === "Bump cancelled." || message === "Release cancelled." || message === "Commit cancelled.";
 }
 
 async function stageAllChanges(pi: ExtensionAPI, repoRoot: string): Promise<string[]> {
@@ -588,9 +696,11 @@ async function chooseCommitMessage(
 	ctx: ExtensionCommandContext,
 	proposedMessage: string,
 	changedPaths: string[],
+	options: BumpRunOptions,
+	cancelMessage: string,
 ): Promise<string> {
 	const normalizedProposal = normalizeCommitMessage(proposedMessage);
-	if (!ctx.hasUI) return normalizedProposal;
+	if (!ctx.hasUI || options.skipConfirmations) return normalizedProposal;
 
 	const preview = changedPaths.slice(0, 8).join(", ");
 	const confirmed = await ctx.ui.confirm(
@@ -601,11 +711,155 @@ async function chooseCommitMessage(
 
 	const custom = await ctx.ui.input("Commit message:", normalizedProposal);
 	const normalizedCustom = normalizeCommitMessage(custom ?? "");
-	if (!normalizedCustom) throw new Error("Bump cancelled.");
+	if (!normalizedCustom) throw new Error(cancelMessage);
 	return normalizedCustom;
 }
 
-async function commitAndPush(
+async function prepareBumpRun(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	args: string,
+	commandName: string = "bump",
+): Promise<PreparedBumpRun> {
+	const parsedArgs = parseArgs(args, commandName);
+	const repoRoot = await getRepoRoot(pi, ctx.cwd);
+	const initialStatus = await getGitStatus(pi, repoRoot);
+	const manifest = await chooseManifest(pi, ctx, repoRoot, parsedArgs);
+	return { repoRoot, parsedArgs, manifest, initialStatus };
+}
+
+async function executePreparedBump(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	prepared: PreparedBumpRun,
+	options: BumpRunOptions,
+): Promise<BumpRunResult> {
+	const { repoRoot, parsedArgs, manifest, initialStatus } = prepared;
+	if (initialStatus.length > 0) {
+		const preview = initialStatus.slice(0, 8).map((entry) => entry.path).join(", ");
+		ctx.ui.notify(
+			`Including existing working tree changes in the bump commit${preview ? ` (${preview}${initialStatus.length > 8 ? ", …" : ""})` : ""}.`,
+			"info",
+		);
+	}
+
+	if (options.skipConfirmations) {
+		ctx.ui.notify("Skipping bump confirmations and using the proposed commit message.", "info");
+	}
+
+	let nextVersion: string | undefined;
+	if (manifest) {
+		nextVersion = computeNextVersion(manifest.version, parsedArgs);
+		if (nextVersion === manifest.version) {
+			throw new Error(`${manifest.relativePath} is already at ${nextVersion}.`);
+		}
+
+		if (ctx.hasUI && !options.skipConfirmations) {
+			const confirmed = await ctx.ui.confirm(
+				"Confirm bump",
+				`${manifest.name || manifest.relativePath}\n\n${manifest.version} → ${nextVersion}\n\nThis will update the manifest, refresh lockfiles/checks, propose a commit message, commit, and push.`,
+			);
+			if (!confirmed) {
+				throw new Error("Bump cancelled.");
+			}
+		}
+
+		await writeManifestVersion(manifest, nextVersion);
+		ctx.ui.notify(`Updated ${manifest.relativePath}: ${manifest.version} → ${nextVersion}`, "info");
+		await runManifestSync(pi, manifest, repoRoot, ctx);
+	} else {
+		ctx.ui.notify("No manifest found, committing and pushing changes as-is.", "info");
+	}
+
+	const staged = await stageAllChanges(pi, repoRoot);
+	const stagedDiff = await getStagedDiff(pi, repoRoot);
+	const proposedMessage = await proposeCommitMessage(ctx, stagedDiff, manifest, nextVersion);
+	const commitMessage = await chooseCommitMessage(ctx, proposedMessage, staged, options, "Bump cancelled.");
+	await commitAndPush(pi, ctx, repoRoot, commitMessage);
+	ctx.ui.notify(`Committed and pushed ${staged.length} file${staged.length === 1 ? "" : "s"}.`, "info");
+	return { repoRoot, manifest, nextVersion };
+}
+
+async function runBump(
+	pi: ExtensionAPI,
+	args: string,
+	ctx: ExtensionCommandContext,
+	options: BumpRunOptions,
+): Promise<BumpRunResult | undefined> {
+	try {
+		const prepared = await prepareBumpRun(pi, ctx, args, "bump");
+		return await executePreparedBump(pi, ctx, prepared, options);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (isCancellationMessage(message)) {
+			ctx.ui.notify(message, "info");
+			return undefined;
+		}
+		ctx.ui.notify(`bump failed: ${message}`, "error");
+		return undefined;
+	}
+}
+
+async function runReleasor2000Release(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	config: ReleaseConfigInfo,
+): Promise<void> {
+	ctx.ui.notify(`Running releasor2000 release from ${config.relativePath}...`, "info");
+	const result = await pi.exec("releasor2000", ["release"], {
+		cwd: config.cwd,
+		timeout: 600_000,
+	});
+	if (result.code !== 0) {
+		throw new Error((result.stderr || result.stdout || "releasor2000 release failed").trim());
+	}
+	ctx.ui.notify("Release completed.", "info");
+}
+
+async function runRelease(
+	pi: ExtensionAPI,
+	args: string,
+	ctx: ExtensionCommandContext,
+	options: BumpRunOptions,
+): Promise<void> {
+	try {
+		const prepared = await prepareBumpRun(pi, ctx, args, "release");
+		const preferredStartDir = prepared.manifest ? dirname(prepared.manifest.path) : ctx.cwd;
+		const config = await chooseReleasorConfig(pi, ctx, prepared.repoRoot, preferredStartDir);
+
+		if (ctx.hasUI && !options.skipConfirmations) {
+			const releaseSummary = prepared.manifest
+				? `${prepared.manifest.name || prepared.manifest.relativePath}\n\n${prepared.manifest.version} → ${computeNextVersion(prepared.manifest.version, prepared.parsedArgs)}`
+				: "No manifest found; the bump step will commit and push existing changes as-is.";
+			const confirmed = await ctx.ui.confirm(
+				"Confirm release",
+				`${releaseSummary}\n\nConfig: ${config.relativePath}\n\nThis will run the bump workflow, then releasor2000 release.`,
+			);
+			if (!confirmed) {
+				ctx.ui.notify("Release cancelled.", "info");
+				return;
+			}
+		}
+
+		const bumpResult = await executePreparedBump(pi, ctx, prepared, options);
+		await runReleasor2000Release(pi, ctx, config);
+		if (bumpResult.nextVersion && bumpResult.manifest) {
+			ctx.ui.notify(
+				`Released ${bumpResult.manifest.name || bumpResult.manifest.relativePath} at ${bumpResult.nextVersion}.`,
+				"info",
+			);
+		}
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (isCancellationMessage(message)) {
+			ctx.ui.notify(message, "info");
+			return;
+		}
+		ctx.ui.notify(`release failed: ${message}`, "error");
+	}
+}
+
+async function commitOnly(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
 	repoRoot: string,
@@ -616,6 +870,58 @@ async function commitAndPush(
 	if (commitResult.code !== 0) {
 		throw new Error((commitResult.stderr || commitResult.stdout || "git commit failed").trim());
 	}
+}
+
+async function runCommit(
+	pi: ExtensionAPI,
+	args: string,
+	ctx: ExtensionCommandContext,
+	options: BumpRunOptions,
+): Promise<void> {
+	try {
+		if (args.trim()) {
+			throw new Error("Usage: /commit[!]");
+		}
+
+		const repoRoot = await getRepoRoot(pi, ctx.cwd);
+		const initialStatus = await getGitStatus(pi, repoRoot);
+		if (initialStatus.length === 0) {
+			throw new Error("No changes to commit.");
+		}
+
+		const preview = initialStatus.slice(0, 8).map((entry) => entry.path).join(", ");
+		ctx.ui.notify(
+			`Including existing working tree changes in the commit${preview ? ` (${preview}${initialStatus.length > 8 ? ", …" : ""})` : ""}.`,
+			"info",
+		);
+
+		if (options.skipConfirmations) {
+			ctx.ui.notify("Skipping commit confirmation and using the proposed commit message.", "info");
+		}
+
+		const staged = await stageAllChanges(pi, repoRoot);
+		const stagedDiff = await getStagedDiff(pi, repoRoot);
+		const proposedMessage = await proposeCommitMessage(ctx, stagedDiff);
+		const commitMessage = await chooseCommitMessage(ctx, proposedMessage, staged, options, "Commit cancelled.");
+		await commitOnly(pi, ctx, repoRoot, commitMessage);
+		ctx.ui.notify(`Committed ${staged.length} file${staged.length === 1 ? "" : "s"}.`, "info");
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (isCancellationMessage(message)) {
+			ctx.ui.notify(message, "info");
+			return;
+		}
+		ctx.ui.notify(`commit failed: ${message}`, "error");
+	}
+}
+
+async function commitAndPush(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	repoRoot: string,
+	commitMessage: string,
+): Promise<void> {
+	await commitOnly(pi, ctx, repoRoot, commitMessage);
 
 	ctx.ui.notify("Pushing...", "info");
 	const pushResult = await pi.exec("git", ["push"], { cwd: repoRoot, timeout: 180_000 });
@@ -629,55 +935,37 @@ export default function bumpExtension(pi: ExtensionAPI) {
 		description: "Bump a package.json or Cargo.toml version, refresh lockfiles, commit, and push",
 		getArgumentCompletions: commandCompletions,
 		handler: async (args, ctx) => {
-			try {
-				const parsedArgs = parseArgs(args);
-				const repoRoot = await getRepoRoot(pi, ctx.cwd);
-				const initialStatus = await getGitStatus(pi, repoRoot);
-				if (initialStatus.length > 0) {
-					const preview = initialStatus.slice(0, 8).map((entry) => entry.path).join(", ");
-					ctx.ui.notify(
-						`Including existing working tree changes in the bump commit${preview ? ` (${preview}${initialStatus.length > 8 ? ", …" : ""})` : ""}.`,
-						"info",
-					);
-				}
-
-				const manifest = await chooseManifest(pi, ctx, repoRoot, parsedArgs);
-
-				let nextVersion: string | undefined;
-				if (manifest) {
-					nextVersion = computeNextVersion(manifest.version, parsedArgs);
-					if (nextVersion === manifest.version) {
-						throw new Error(`${manifest.relativePath} is already at ${nextVersion}.`);
-					}
-
-					if (ctx.hasUI) {
-						const confirmed = await ctx.ui.confirm(
-							"Confirm bump",
-							`${manifest.name || manifest.relativePath}\n\n${manifest.version} → ${nextVersion}\n\nThis will update the manifest, refresh lockfiles/checks, propose a commit message, commit, and push.`,
-						);
-						if (!confirmed) {
-							ctx.ui.notify("Bump cancelled.", "info");
-							return;
-						}
-					}
-
-					await writeManifestVersion(manifest, nextVersion);
-					ctx.ui.notify(`Updated ${manifest.relativePath}: ${manifest.version} → ${nextVersion}`, "info");
-					await runManifestSync(pi, manifest, repoRoot, ctx);
-				} else {
-					ctx.ui.notify("No manifest found, committing and pushing changes as-is.", "info");
-				}
-
-				const staged = await stageAllChanges(pi, repoRoot);
-				const stagedDiff = await getStagedDiff(pi, repoRoot);
-				const proposedMessage = await proposeCommitMessage(ctx, stagedDiff, manifest, nextVersion);
-				const commitMessage = await chooseCommitMessage(ctx, proposedMessage, staged);
-				await commitAndPush(pi, ctx, repoRoot, commitMessage);
-				ctx.ui.notify(`Committed and pushed ${staged.length} file${staged.length === 1 ? "" : "s"}.`, "info");
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				ctx.ui.notify(`bump failed: ${message}`, "error");
-			}
+			await runBump(pi, args, ctx, { skipConfirmations: false });
 		},
+	});
+
+	pi.registerCommand("bump!", {
+		description: "Same as /bump, but skips confirmation prompts and commits immediately",
+		getArgumentCompletions: commandCompletions,
+		handler: async (args, ctx) => {
+			await runBump(pi, args, ctx, { skipConfirmations: true });
+		},
+	});
+
+	pi.registerCommand("commit", {
+		description: "Stage all changes, generate a commit message, and commit locally",
+		handler: async (args, ctx) => runCommit(pi, args, ctx, { skipConfirmations: false }),
+	});
+
+	pi.registerCommand("commit!", {
+		description: "Same as /commit, but skips confirmation prompts and commits immediately",
+		handler: async (args, ctx) => runCommit(pi, args, ctx, { skipConfirmations: true }),
+	});
+
+	pi.registerCommand("release", {
+		description: "Run /bump, then releasor2000 release when a releasor2000.toml exists",
+		getArgumentCompletions: commandCompletions,
+		handler: async (args, ctx) => runRelease(pi, args, ctx, { skipConfirmations: false }),
+	});
+
+	pi.registerCommand("release!", {
+		description: "Same as /release, but skips confirmation prompts and runs immediately",
+		getArgumentCompletions: commandCompletions,
+		handler: async (args, ctx) => runRelease(pi, args, ctx, { skipConfirmations: true }),
 	});
 }

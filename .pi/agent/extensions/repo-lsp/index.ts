@@ -45,16 +45,16 @@ export default function repoLspExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "go_to_definition",
 		label: "Go to Definition",
-		description: "Resolve the definition location for a symbol at a given file position using a language server. If the required LSP is missing, prompts the user to install it.",
-		promptSnippet: "Resolve symbol definitions via an LSP-backed go-to-definition request.",
+		description: "Resolve the definition location for a symbol at a given file position using a language server, with a heuristic text fallback when no LSP is available.",
+		promptSnippet: "Resolve symbol definitions via an LSP-backed request with an automatic fallback.",
 		promptGuidelines: [
 			"Use go_to_definition when you know the file path and cursor position of the symbol you want to navigate.",
 			"If you do not yet know the exact position, use symbol_search first or inspect the file with read.",
-			"If the tool reports a missing language server, ask the user to install it and then retry.",
+			"Prefer this for symbol-aware navigation; if no language server is available, the tool falls back automatically and reports that limitation.",
 		],
 		parameters: DefinitionParams,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			onUpdate?.({ content: [{ type: "text", text: "Resolving definition via LSP..." }], details: {} });
+			onUpdate?.({ content: [{ type: "text", text: "Resolving definition..." }], details: {} });
 			const path = await resolveToolPath(ctx, params.path);
 			const result = await runGoToDefinition({
 				pi,
@@ -64,14 +64,18 @@ export default function repoLspExtension(pi: ExtensionAPI) {
 				column: params.column,
 				signal,
 			});
+			const modeSuffix = result.mode === "fallback" ? " via fallback" : "";
+			const note = result.note ? `\n\nNote: ${result.note}` : "";
 			const summary = result.results.length > 0
-				? `Found ${result.results.length} definition${result.results.length === 1 ? "" : "s"}.\n${formatLocationSummary(ctx.cwd, result.results)}`
-				: "No definitions found.";
+				? `Found ${result.results.length} definition${result.results.length === 1 ? "" : "s"}${modeSuffix}.\n${formatLocationSummary(ctx.cwd, result.results)}${note}`
+				: `No definitions found${modeSuffix}.${note}`;
 			return {
 				content: [{ type: "text", text: summary }],
 				details: {
 					language: result.language,
 					workspaceRoot: result.workspaceRoot,
+					mode: result.mode,
+					note: result.note,
 					results: result.results,
 				},
 			};
@@ -81,16 +85,16 @@ export default function repoLspExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "find_references",
 		label: "Find References",
-		description: "Find project-wide references for a symbol at a given file position using a language server. If the required LSP is missing, prompts the user to install it.",
-		promptSnippet: "Find symbol references via an LSP-backed find-references request.",
+		description: "Find project-wide references for a symbol at a given file position using a language server, with a heuristic text fallback when no LSP is available.",
+		promptSnippet: "Find symbol references via an LSP-backed request with an automatic fallback.",
 		promptGuidelines: [
 			"Use find_references when you know the file path and cursor position of the symbol you want to analyze.",
 			"If you want only usages, leave includeDeclaration unset or false.",
-			"If the tool reports a missing language server, ask the user to install it and then retry.",
+			"Prefer this for symbol-aware results; if no language server is available, the tool falls back automatically and reports that limitation.",
 		],
 		parameters: ReferencesParams,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			onUpdate?.({ content: [{ type: "text", text: "Finding references via LSP..." }], details: {} });
+			onUpdate?.({ content: [{ type: "text", text: "Finding references..." }], details: {} });
 			const path = await resolveToolPath(ctx, params.path);
 			const result = await runFindReferences({
 				pi,
@@ -101,14 +105,18 @@ export default function repoLspExtension(pi: ExtensionAPI) {
 				includeDeclaration: Boolean(params.includeDeclaration),
 				signal,
 			});
+			const modeSuffix = result.mode === "fallback" ? " via fallback" : "";
+			const note = result.note ? `\n\nNote: ${result.note}` : "";
 			const summary = result.results.length > 0
-				? `Found ${result.results.length} reference${result.results.length === 1 ? "" : "s"}.\n${formatLocationSummary(ctx.cwd, result.results)}`
-				: "No references found.";
+				? `Found ${result.results.length} reference${result.results.length === 1 ? "" : "s"}${modeSuffix}.\n${formatLocationSummary(ctx.cwd, result.results)}${note}`
+				: `No references found${modeSuffix}.${note}`;
 			return {
 				content: [{ type: "text", text: summary }],
 				details: {
 					language: result.language,
 					workspaceRoot: result.workspaceRoot,
+					mode: result.mode,
+					note: result.note,
 					results: result.results,
 				},
 			};
@@ -118,17 +126,17 @@ export default function repoLspExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "symbol_search",
 		label: "Symbol Search",
-		description: "Search workspace symbols through a language server. Useful for finding symbol candidates before go-to-definition or find-references. If the required LSP is missing, prompts the user to install it.",
-		promptSnippet: "Search workspace symbols via an LSP-backed symbol index.",
+		description: "Search workspace symbols through a language server, with a heuristic definition fallback when no LSP is available.",
+		promptSnippet: "Search workspace symbols via an LSP-backed index with an automatic fallback.",
 		promptGuidelines: [
 			"Use symbol_search when grep is too noisy and you want symbol-level results from a language server.",
 			"Provide a path or language hint when working in a mixed-language repository so the correct language server is selected.",
 			"Use symbol_search before go_to_definition or find_references if you do not yet know the exact file position.",
-			"If the tool reports a missing language server, ask the user to install it and then retry.",
+			"If no language server is available, the tool falls back automatically and reports that limitation.",
 		],
 		parameters: SymbolSearchParams,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			onUpdate?.({ content: [{ type: "text", text: "Searching symbols via LSP..." }], details: {} });
+			onUpdate?.({ content: [{ type: "text", text: "Searching symbols..." }], details: {} });
 			const path = params.path ? await resolveToolPath(ctx, params.path) : undefined;
 			const result = await runSymbolSearch({
 				pi,
@@ -139,14 +147,18 @@ export default function repoLspExtension(pi: ExtensionAPI) {
 				limit: params.limit ?? 20,
 				signal,
 			});
+			const modeSuffix = result.mode === "fallback" ? " via fallback" : "";
+			const note = result.note ? `\n\nNote: ${result.note}` : "";
 			const summary = result.results.length > 0
-				? `Found ${result.results.length} symbol${result.results.length === 1 ? "" : "s"}.\n${formatSymbolSummary(ctx.cwd, result.results)}`
-				: "No symbols found.";
+				? `Found ${result.results.length} symbol${result.results.length === 1 ? "" : "s"}${modeSuffix}.\n${formatSymbolSummary(ctx.cwd, result.results)}${note}`
+				: `No symbols found${modeSuffix}.${note}`;
 			return {
 				content: [{ type: "text", text: summary }],
 				details: {
 					language: result.language,
 					workspaceRoot: result.workspaceRoot,
+					mode: result.mode,
+					note: result.note,
 					results: result.results,
 				},
 			};
@@ -156,17 +168,17 @@ export default function repoLspExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "workspace_diagnostics",
 		label: "Workspace Diagnostics",
-		description: "Collect diagnostics from a language server. Uses workspace-wide pull diagnostics when available, otherwise falls back to single-file diagnostics when a file path is provided. If the required LSP is missing, prompts the user to install it.",
-		promptSnippet: "Collect LSP diagnostics for a workspace or file.",
+		description: "Collect diagnostics from a language server. Uses workspace-wide pull diagnostics when available, otherwise falls back to document diagnostics or best-effort non-LSP checks when possible.",
+		promptSnippet: "Collect diagnostics for a workspace or file, preferring LSP but falling back automatically when needed.",
 		promptGuidelines: [
 			"Use workspace_diagnostics when you want structured editor-like diagnostics instead of scraping build output.",
 			"Provide a path or language hint in mixed-language repositories so the correct language server is selected.",
 			"If the server does not support workspace-wide diagnostics, provide a file path so the tool can fall back to single-file diagnostics.",
-			"If the tool reports a missing language server, ask the user to install it and then retry.",
+			"If no language server is available, the tool falls back automatically when possible and reports any limitations.",
 		],
 		parameters: WorkspaceDiagnosticsParams,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			onUpdate?.({ content: [{ type: "text", text: "Collecting diagnostics via LSP..." }], details: {} });
+			onUpdate?.({ content: [{ type: "text", text: "Collecting diagnostics..." }], details: {} });
 			const path = params.path ? await resolveToolPath(ctx, params.path) : undefined;
 			const result = await runWorkspaceDiagnostics({
 				pi,
