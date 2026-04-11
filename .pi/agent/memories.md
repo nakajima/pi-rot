@@ -4,6 +4,7 @@
 - Prefer inaction over action. Don't just jump into writing code unless specifically instructed or the task is extremely simple.
 - do not add 3rd party dependencies without explicit confirmation
 - if you are choosing between expedience and correctness, always go with correctness.
+- if i just say "ok" it means do the thing you said you were going to do.
 
 ## Candidate memories
 
