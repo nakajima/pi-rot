@@ -5,11 +5,17 @@
 - do not add 3rd party dependencies without explicit confirmation
 - if you are choosing between expedience and correctness, always go with correctness.
 - if i just say "ok" it means do the thing you said you were going to do.
-
-## Candidate memories
-
-- Do not use bullets, markdown, quotes, prefixes, or hedging commentary. [count: 1]
-  - Do not use bullets, markdown, quotes, prefixes, or hedging commentary.
-
-- don't use the active model but if there's no anthropic creds available we should fallback to what is. [count: 1]
-  - don't use the active model but if there's no anthropic creds available we should fallback to what is.
+- First identify the task mode: explain, compare, plan, implement, debug, or review. Do not implement while the user is still exploring options.
+- Lock in the exact target before acting: surface, layer, owner, and scope.
+- Treat user corrections as hard resets. Drop the old framing immediately.
+- Respect explicit constraints and rejected approaches. Do not reintroduce them indirectly.
+- Prefer the smallest correct change. Do not add abstraction, indirection, or redesign unless clearly needed.
+- Solve the requested problem, not adjacent ones.
+- For UI/interaction work, validate with real behavior when possible; do not rely only on a mental model.
+- Prefer the real mechanism over hacks; verify the failing layer before fixing.
+- Preserve ownership boundaries between modules/layers/providers.
+- Ask fewer, higher-value questions. If a reasonable default exists, state it and proceed.
+- Before implementing, sanity-check that the plan is scoped correctly and not overbuilt.
+- When reporting back, state what changed, what assumptions were made, and what was actually validated.
+- do not use non-ascii characters in comments [inferred]
+- never use "pills" when designing [inferred]

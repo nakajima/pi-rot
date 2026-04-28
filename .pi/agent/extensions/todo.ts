@@ -59,13 +59,13 @@ function buildSelectLabels(items: string[]): string[] {
 	const labels: string[] = [];
 	for (let i = 0; i < items.length; i++) {
 		labels.push(`${i + 1}. ${items[i]}`);
-		labels.push(DELETE_PREFIX);
+		labels.push(`${DELETE_PREFIX} ${i + 1}`);
 	}
 	return labels;
 }
 
 function isDeleteLabel(label: string): boolean {
-	return label === DELETE_PREFIX;
+	return label.startsWith(DELETE_PREFIX);
 }
 
 function itemIndexFromDeleteLabel(labels: string[], selectedIndex: number): number {
@@ -110,7 +110,7 @@ export default function todoExtension(pi: ExtensionAPI) {
 			if (body) {
 				const action = await appendTodo(todoPath, body);
 				ctx.ui.notify(`${action === "created" ? "Created" : "Appended to"} ${todoPath}`, "info");
-				return;
+				return { message: undefined };
 			}
 
 			if (!ctx.hasUI) {
