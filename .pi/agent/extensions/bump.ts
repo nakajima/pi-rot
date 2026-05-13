@@ -10,6 +10,7 @@ type BumpKind = (typeof BUMP_KINDS)[number];
 
 type ManifestType = "package-json" | "cargo-toml";
 type PackageManager = "bun" | "npm" | "pnpm" | "yarn";
+type CargoVersionSource = "package" | "workspace-package";
 
 interface ManifestInfo {
 	path: string;
@@ -17,6 +18,10 @@ interface ManifestInfo {
 	type: ManifestType;
 	name?: string;
 	version: string;
+	versionPath: string;
+	versionRelativePath: string;
+	cargoVersionSource?: CargoVersionSource;
+	isVirtualCargoWorkspace?: boolean;
 	packageManagerField?: string;
 	scripts?: Record<string, string>;
 }
@@ -110,7 +115,7 @@ function parseArgs(args: string, commandName: string = "bump"): ParsedArgs {
 			continue;
 		}
 
-		if (manifestPath) throw new Error(`Too many arguments. Usage: /${commandName}[!] [patch|minor|major|x.y.z] [path]`);
+		if (manifestPath) throw new Error(`Too many arguments. Usage: /${commandName}[!] [patch|minor|major|x.y.z] [path|package-or-crate-name]`);
 		manifestPath = token;
 	}
 
@@ -208,59 +213,145 @@ async function readPackageJsonManifest(path: string, repoRoot: string): Promise<
 		throw new Error(`${normalizePath(relative(repoRoot, path))} does not contain a string version field.`);
 	}
 
+	const relativePath = normalizePath(relative(repoRoot, path));
 	return {
 		path,
-		relativePath: normalizePath(relative(repoRoot, path)),
+		relativePath,
 		type: "package-json",
 		name: typeof parsed.name === "string" ? parsed.name : undefined,
 		version: parsed.version,
+		versionPath: path,
+		versionRelativePath: relativePath,
 		packageManagerField: typeof parsed.packageManager === "string" ? parsed.packageManager : undefined,
 		scripts: parsed.scripts,
 	};
 }
 
-function readCargoPackageFields(raw: string): { name?: string; version?: string } {
+interface CargoManifestFields {
+	hasPackage: boolean;
+	name?: string;
+	version?: string;
+	versionUsesWorkspace: boolean;
+	workspaceVersion?: string;
+}
+
+function readCargoManifestFields(raw: string): CargoManifestFields {
 	const lines = raw.split(/\r?\n/);
-	let inPackage = false;
+	let section = "";
+	let hasPackage = false;
 	let name: string | undefined;
 	let version: string | undefined;
+	let versionUsesWorkspace = false;
+	let workspaceVersion: string | undefined;
 
 	for (const line of lines) {
 		const header = line.match(/^\s*\[([^\]]+)\]\s*$/);
 		if (header) {
-			inPackage = header[1] === "package";
+			section = header[1]?.trim() || "";
+			if (section === "package") hasPackage = true;
 			continue;
 		}
-		if (!inPackage) continue;
 
-		if (!name) {
-			const nameMatch = line.match(/^\s*name\s*=\s*"([^"]+)"/);
-			if (nameMatch) name = nameMatch[1];
+		if (section === "package") {
+			if (!name) {
+				const nameMatch = line.match(/^\s*name\s*=\s*"([^"]+)"/);
+				if (nameMatch) name = nameMatch[1];
+			}
+			if (!version && !versionUsesWorkspace) {
+				const versionMatch = line.match(/^\s*version\s*=\s*"([^"]+)"/);
+				if (versionMatch) {
+					version = versionMatch[1];
+				} else if (/^\s*version\.workspace\s*=\s*true\b/.test(line) || /^\s*version\s*=\s*\{[^}]*\bworkspace\s*=\s*true\b[^}]*\}/.test(line)) {
+					versionUsesWorkspace = true;
+				}
+			}
+			continue;
 		}
-		if (!version) {
+
+		if (section === "workspace.package" && !workspaceVersion) {
 			const versionMatch = line.match(/^\s*version\s*=\s*"([^"]+)"/);
-			if (versionMatch) version = versionMatch[1];
+			if (versionMatch) workspaceVersion = versionMatch[1];
 		}
-		if (name && version) break;
 	}
 
-	return { name, version };
+	return { hasPackage, name, version, versionUsesWorkspace, workspaceVersion };
+}
+
+async function findWorkspacePackageVersion(repoRoot: string, startDir: string): Promise<{ path: string; version: string } | undefined> {
+	const normalizedRepoRoot = normalizePath(repoRoot);
+	let currentDir = resolve(startDir);
+
+	while (true) {
+		const normalizedCurrentDir = normalizePath(currentDir);
+		if (normalizedCurrentDir !== normalizedRepoRoot && !normalizedCurrentDir.startsWith(`${normalizedRepoRoot}/`)) return undefined;
+
+		const candidate = join(currentDir, "Cargo.toml");
+		if (await pathExists(candidate)) {
+			const raw = await readFile(candidate, "utf8");
+			const parsed = readCargoManifestFields(raw);
+			if (parsed.workspaceVersion) return { path: candidate, version: parsed.workspaceVersion };
+		}
+
+		if (normalizedCurrentDir === normalizedRepoRoot) return undefined;
+		const parent = dirname(currentDir);
+		if (parent === currentDir) return undefined;
+		currentDir = parent;
+	}
 }
 
 async function readCargoManifest(path: string, repoRoot: string): Promise<ManifestInfo> {
 	const raw = await readFile(path, "utf8");
-	const parsed = readCargoPackageFields(raw);
-	if (!parsed.version) {
-		throw new Error(`${normalizePath(relative(repoRoot, path))} does not contain package.version in [package].`);
+	const parsed = readCargoManifestFields(raw);
+	const relativePath = normalizePath(relative(repoRoot, path));
+
+	if (!parsed.hasPackage) {
+		if (!parsed.workspaceVersion) {
+			throw new Error(`${relativePath} does not contain a bumpable package version.`);
+		}
+		return {
+			path,
+			relativePath,
+			type: "cargo-toml",
+			name: "Cargo workspace",
+			version: parsed.workspaceVersion,
+			versionPath: path,
+			versionRelativePath: relativePath,
+			cargoVersionSource: "workspace-package",
+			isVirtualCargoWorkspace: true,
+		};
 	}
 
-	return {
-		path,
-		relativePath: normalizePath(relative(repoRoot, path)),
-		type: "cargo-toml",
-		name: parsed.name,
-		version: parsed.version,
-	};
+	if (parsed.version) {
+		return {
+			path,
+			relativePath,
+			type: "cargo-toml",
+			name: parsed.name,
+			version: parsed.version,
+			versionPath: path,
+			versionRelativePath: relativePath,
+			cargoVersionSource: "package",
+		};
+	}
+
+	if (parsed.versionUsesWorkspace) {
+		const workspaceVersion = await findWorkspacePackageVersion(repoRoot, dirname(path));
+		if (!workspaceVersion) {
+			throw new Error(`${relativePath} uses workspace version but no [workspace.package] version was found.`);
+		}
+		return {
+			path,
+			relativePath,
+			type: "cargo-toml",
+			name: parsed.name,
+			version: workspaceVersion.version,
+			versionPath: workspaceVersion.path,
+			versionRelativePath: normalizePath(relative(repoRoot, workspaceVersion.path)),
+			cargoVersionSource: "workspace-package",
+		};
+	}
+
+	throw new Error(`${relativePath} does not contain package.version in [package].`);
 }
 
 async function readManifestInfo(path: string, repoRoot: string): Promise<ManifestInfo> {
@@ -270,16 +361,36 @@ async function readManifestInfo(path: string, repoRoot: string): Promise<Manifes
 	throw new Error(`Unsupported manifest: ${path}`);
 }
 
-async function resolveManifestPath(pathArg: string, repoRoot: string, cwd: string): Promise<string> {
+function isUnbumpableManifestCandidate(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return message.includes("does not contain a bumpable package version.") || message.includes("does not contain a string version field.");
+}
+
+async function readManifestCandidateInfo(path: string, repoRoot: string): Promise<ManifestInfo | undefined> {
+	try {
+		return await readManifestInfo(path, repoRoot);
+	} catch (error) {
+		if (isUnbumpableManifestCandidate(error)) return undefined;
+		throw error;
+	}
+}
+
+async function listManifestInfos(pi: ExtensionAPI, repoRoot: string): Promise<ManifestInfo[]> {
+	const candidates = await listManifestCandidates(pi, repoRoot);
+	const infos = await Promise.all(candidates.map((candidate) => readManifestCandidateInfo(join(repoRoot, candidate), repoRoot)));
+	return infos
+		.filter((manifest): manifest is ManifestInfo => manifest !== undefined)
+		.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+}
+
+async function resolveExistingManifestPath(pathArg: string, repoRoot: string, cwd: string): Promise<string | undefined> {
 	const fromCwd = resolve(cwd, pathArg);
 	const fromRepoRoot = resolve(repoRoot, pathArg);
 	const initialPath = await pathExists(fromCwd) ? fromCwd : fromRepoRoot;
 	const repoRootNormalized = normalizePath(repoRoot);
 	let targetPath = initialPath;
 
-	if (!(await pathExists(initialPath))) {
-		throw new Error(`Could not find ${pathArg}`);
-	}
+	if (!(await pathExists(initialPath))) return undefined;
 
 	const stats = await stat(initialPath);
 	if (stats.isDirectory()) {
@@ -302,6 +413,35 @@ async function resolveManifestPath(pathArg: string, repoRoot: string, cwd: strin
 	return targetPath;
 }
 
+function describeManifest(manifest: ManifestInfo): string {
+	const label = `${manifest.relativePath} (${manifest.name || manifest.type} ${manifest.version})`;
+	if (manifest.versionRelativePath === manifest.relativePath) return label;
+	return `${label}, version in ${manifest.versionRelativePath}`;
+}
+
+function describeVersionChange(manifest: ManifestInfo, nextVersion: string): string {
+	const lines = [manifest.name || manifest.relativePath, "", `${manifest.version} → ${nextVersion}`];
+	if (manifest.versionRelativePath !== manifest.relativePath) {
+		lines.push("", `Version source: ${manifest.versionRelativePath}`);
+	}
+	return lines.join("\n");
+}
+
+async function resolveManifestTarget(pi: ExtensionAPI, repoRoot: string, cwd: string, target: string): Promise<ManifestInfo> {
+	const resolvedPath = await resolveExistingManifestPath(target, repoRoot, cwd);
+	if (resolvedPath) return readManifestInfo(resolvedPath, repoRoot);
+
+	const manifestInfos = await listManifestInfos(pi, repoRoot);
+	const matches = manifestInfos.filter((manifest) => manifest.name === target);
+	if (matches.length === 0) {
+		throw new Error(`Could not find a manifest path or package/crate named ${target}.`);
+	}
+	if (matches.length > 1) {
+		throw new Error(`Multiple manifests named ${target}: ${matches.map((manifest) => manifest.relativePath).join(", ")}. Specify a path instead.`);
+	}
+	return matches[0]!;
+}
+
 async function chooseManifest(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
@@ -309,26 +449,21 @@ async function chooseManifest(
 	parsedArgs: ParsedArgs,
 ): Promise<ManifestInfo | undefined> {
 	if (parsedArgs.manifestPath) {
-		const resolved = await resolveManifestPath(parsedArgs.manifestPath, repoRoot, ctx.cwd);
-		return readManifestInfo(resolved, repoRoot);
+		return resolveManifestTarget(pi, repoRoot, ctx.cwd, parsedArgs.manifestPath);
 	}
 
-	const candidates = await listManifestCandidates(pi, repoRoot);
-	if (candidates.length === 0) return undefined;
-	if (candidates.length === 1) return readManifestInfo(join(repoRoot, candidates[0]!), repoRoot);
+	const manifestInfos = await listManifestInfos(pi, repoRoot);
+	if (manifestInfos.length === 0) return undefined;
+	if (manifestInfos.length === 1) return manifestInfos[0];
 
-	const rootCandidates = candidates.filter((candidate) => !candidate.includes("/"));
-	if (rootCandidates.length === 1) return readManifestInfo(join(repoRoot, rootCandidates[0]!), repoRoot);
+	const rootCandidates = manifestInfos.filter((manifest) => !manifest.relativePath.includes("/") && !manifest.isVirtualCargoWorkspace);
+	if (rootCandidates.length === 1) return rootCandidates[0];
 
 	if (!ctx.hasUI) {
-		throw new Error(`Multiple manifests found: ${candidates.join(", ")}. Re-run with an explicit path.`);
+		throw new Error(`Multiple manifests found: ${manifestInfos.map((manifest) => manifest.relativePath).join(", ")}. Re-run with an explicit path or package/crate name.`);
 	}
 
-	const manifestInfos = await Promise.all(candidates.map((candidate) => readManifestInfo(join(repoRoot, candidate), repoRoot)));
-	const options = manifestInfos.map((manifest) => {
-		const label = `${manifest.relativePath} (${manifest.name || manifest.type} ${manifest.version})`;
-		return { label, manifest };
-	});
+	const options = manifestInfos.map((manifest) => ({ label: describeManifest(manifest), manifest }));
 	const selection = await ctx.ui.select(
 		"Choose a manifest to bump",
 		options.map((option) => option.label),
@@ -427,19 +562,20 @@ function updatePackageJsonVersion(raw: string, nextVersion: string): string {
 	return next;
 }
 
-function updateCargoTomlVersion(raw: string, nextVersion: string): string {
+function updateCargoTomlVersion(raw: string, nextVersion: string, source: CargoVersionSource): string {
 	const lines = raw.split(/\r?\n/);
-	let inPackage = false;
+	let inTargetSection = false;
 	let updated = false;
+	const targetSection = source === "workspace-package" ? "workspace.package" : "package";
 
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i]!;
 		const header = line.match(/^\s*\[([^\]]+)\]\s*$/);
 		if (header) {
-			inPackage = header[1] === "package";
+			inTargetSection = header[1] === targetSection;
 			continue;
 		}
-		if (!inPackage) continue;
+		if (!inTargetSection) continue;
 
 		const versionMatch = line.match(/^(\s*version\s*=\s*")([^"]+)(".*)$/);
 		if (versionMatch) {
@@ -449,14 +585,16 @@ function updateCargoTomlVersion(raw: string, nextVersion: string): string {
 		}
 	}
 
-	if (!updated) throw new Error("Could not update package.version in Cargo.toml.");
+	if (!updated) throw new Error(`Could not update ${targetSection}.version in Cargo.toml.`);
 	return lines.join("\n");
 }
 
 async function writeManifestVersion(manifest: ManifestInfo, nextVersion: string): Promise<void> {
-	const raw = await readFile(manifest.path, "utf8");
-	const updated = manifest.type === "package-json" ? updatePackageJsonVersion(raw, nextVersion) : updateCargoTomlVersion(raw, nextVersion);
-	await writeFile(manifest.path, updated, "utf8");
+	const raw = await readFile(manifest.versionPath, "utf8");
+	const updated = manifest.type === "package-json"
+		? updatePackageJsonVersion(raw, nextVersion)
+		: updateCargoTomlVersion(raw, nextVersion, manifest.cargoVersionSource ?? "package");
+	await writeFile(manifest.versionPath, updated, "utf8");
 }
 
 async function detectPackageManager(manifest: ManifestInfo, repoRoot: string): Promise<PackageManager> {
@@ -757,7 +895,7 @@ async function executePreparedBump(
 		if (ctx.hasUI && !options.skipConfirmations) {
 			const confirmed = await ctx.ui.confirm(
 				"Confirm bump",
-				`${manifest.name || manifest.relativePath}\n\n${manifest.version} → ${nextVersion}\n\nThis will update the manifest, refresh lockfiles/checks, propose a commit message, commit, and push.`,
+				`${describeVersionChange(manifest, nextVersion)}\n\nThis will update the manifest, refresh lockfiles/checks, propose a commit message, commit, and push.`,
 			);
 			if (!confirmed) {
 				throw new Error("Bump cancelled.");
@@ -765,7 +903,7 @@ async function executePreparedBump(
 		}
 
 		await writeManifestVersion(manifest, nextVersion);
-		ctx.ui.notify(`Updated ${manifest.relativePath}: ${manifest.version} → ${nextVersion}`, "info");
+		ctx.ui.notify(`Updated ${manifest.versionRelativePath}: ${manifest.version} → ${nextVersion}`, "info");
 		await runManifestSync(pi, manifest, repoRoot, ctx);
 	} else {
 		ctx.ui.notify("No manifest found, committing and pushing changes as-is.", "info");
@@ -829,7 +967,7 @@ async function runRelease(
 
 		if (ctx.hasUI && !options.skipConfirmations) {
 			const releaseSummary = prepared.manifest
-				? `${prepared.manifest.name || prepared.manifest.relativePath}\n\n${prepared.manifest.version} → ${computeNextVersion(prepared.manifest.version, prepared.parsedArgs)}`
+				? describeVersionChange(prepared.manifest, computeNextVersion(prepared.manifest.version, prepared.parsedArgs))
 				: "No manifest found; the bump step will commit and push existing changes as-is.";
 			const confirmed = await ctx.ui.confirm(
 				"Confirm release",
@@ -932,7 +1070,7 @@ async function commitAndPush(
 
 export default function bumpExtension(pi: ExtensionAPI) {
 	pi.registerCommand("bump", {
-		description: "Bump a package.json or Cargo.toml version, refresh lockfiles, commit, and push",
+		description: "Bump a package.json or Cargo.toml version by path or package/crate name, refresh lockfiles, commit, and push",
 		getArgumentCompletions: commandCompletions,
 		handler: async (args, ctx) => {
 			await runBump(pi, args, ctx, { skipConfirmations: false });
@@ -958,7 +1096,7 @@ export default function bumpExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("release", {
-		description: "Run /bump, then releasor2000 release when a releasor2000.toml exists",
+		description: "Run /bump by path or package/crate name, then releasor2000 release when a releasor2000.toml exists",
 		getArgumentCompletions: commandCompletions,
 		handler: async (args, ctx) => runRelease(pi, args, ctx, { skipConfirmations: false }),
 	});

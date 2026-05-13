@@ -19,3 +19,8 @@
 - When reporting back, state what changed, what assumptions were made, and what was actually validated.
 - do not use non-ascii characters in comments [inferred]
 - never use "pills" when designing [inferred]
+
+## Candidate memories
+
+- by default it should filter the list but if i type something like "user@host" it should just connect if there's no match. [count: 1]
+  - by default it should filter the list but if i type something like "user@host" it should just connect if there's no match.
