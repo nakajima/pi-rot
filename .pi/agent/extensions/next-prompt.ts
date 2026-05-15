@@ -8,7 +8,7 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { CURSOR_MARKER, truncateToWidth, visibleWidth, type EditorTheme, type TUI } from "@mariozechner/pi-tui";
 
-const VERSION = "2026-05-15.10";
+const VERSION = "2026-05-15.11";
 const STATUS_KEY = "next-prompt";
 const MAX_TRANSCRIPT_CHARS = 8000;
 const MAX_PROMPT_CHARS = 140;
@@ -209,7 +209,7 @@ async function completeSuggestion(resolved: ResolvedModel, transcript: string, s
 		{
 			apiKey: resolved.auth.apiKey,
 			headers: resolved.auth.headers,
-			maxTokens: 32,
+			maxTokens: 48,
 			temperature: 0.2,
 			maxRetries: 0,
 			timeoutMs: MODEL_TIMEOUT_MS,
@@ -253,7 +253,7 @@ function cleanSuggestion(raw: string): string | undefined {
 function buildSuggestionPrompt(transcript: string): string {
 	return [
 		"You are drafting the user's next message in a coding-agent chat.",
-		"Return exactly one short prompt, plain text only.",
+		"Always return exactly one short prompt, plain text only.",
 		"Hard limit: 10 words or fewer.",
 		"Write what the user should say next, not a summary of the conversation.",
 		"If the assistant asked a numbered/design question and gave a recommended answer, accept the recommendation and name the concrete change.",
@@ -263,7 +263,8 @@ function buildSuggestionPrompt(transcript: string): string {
 		"Good: Yes - remove last_sync_at and add stamp helpers.",
 		"Bad: Continue with the smallest correct next step.",
 		"Good: Add the Syncer stamp path helper.",
-		"If no useful next prompt exists, return an empty string.",
+		"If uncertain, choose the safest concrete continuation.",
+		"Do not return an empty string for a non-empty conversation.",
 		"",
 		"<conversation>",
 		transcript,
@@ -318,8 +319,11 @@ export default function nextPromptExtension(pi: ExtensionAPI) {
 					.map((part) => part.text)
 					.join("\n");
 				const suggestion = cleanSuggestion(raw);
-				setSuggestion(ctx, suggestion);
-				return;
+				if (suggestion) {
+					setSuggestion(ctx, suggestion);
+					return;
+				}
+				lastError = new Error("Suggestion model returned an empty prompt.");
 			} catch (error) {
 				if (localGenerationId !== generationId || abortController.signal.aborted) return;
 				lastError = error;
