@@ -8,10 +8,10 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { CURSOR_MARKER, truncateToWidth, visibleWidth, type EditorTheme, type TUI } from "@mariozechner/pi-tui";
 
-const VERSION = "2026-05-15.8";
+const VERSION = "2026-05-15.10";
 const STATUS_KEY = "next-prompt";
 const MAX_TRANSCRIPT_CHARS = 8000;
-const MAX_PROMPT_CHARS = 280;
+const MAX_PROMPT_CHARS = 140;
 const FAST_MODEL_HINTS = ["haiku", "mini", "nano", "flash", "lite", "small", "fast", "8b", "4o-mini"];
 const SKIPPED_MODEL_PATTERNS = [/\bclaude-3(?:[-.]|\b)/, /deprecated/];
 const MAX_MODEL_ATTEMPTS = 3;
@@ -209,7 +209,7 @@ async function completeSuggestion(resolved: ResolvedModel, transcript: string, s
 		{
 			apiKey: resolved.auth.apiKey,
 			headers: resolved.auth.headers,
-			maxTokens: 96,
+			maxTokens: 32,
 			temperature: 0.2,
 			maxRetries: 0,
 			timeoutMs: MODEL_TIMEOUT_MS,
@@ -250,99 +250,20 @@ function cleanSuggestion(raw: string): string | undefined {
 	return text.length > MAX_PROMPT_CHARS ? `${text.slice(0, MAX_PROMPT_CHARS).trim()}...` : text;
 }
 
-function lastTranscriptBlock(transcript: string, role: "User" | "Assistant"): string | undefined {
-	const marker = `${role}: `;
-	const index = transcript.lastIndexOf(marker);
-	if (index < 0) return undefined;
-	return transcript.slice(index + marker.length).split(/\n\n(?:User|Assistant): /)[0]?.trim();
-}
-
-function splitSentences(text: string): string[] {
-	return text
-		.replace(/\s+/g, " ")
-		.split(/(?<=[.!?])\s+/)
-		.map((sentence) => sentence.trim())
-		.filter((sentence) => sentence.length > 0);
-}
-
-function lowerFirst(text: string): string {
-	return text ? text[0]!.toLowerCase() + text.slice(1) : text;
-}
-
-function upperFirst(text: string): string {
-	return text ? text[0]!.toUpperCase() + text.slice(1) : text;
-}
-
-function sentenceToPrompt(sentence: string): string | undefined {
-	let text = cleanSuggestion(sentence);
-	if (!text) return undefined;
-	text = text.replace(/^(I recommend|I would recommend|You should|We should)\s+/i, "").trim();
-	text = text.replace(/^(The next step is to|Next,?\s+|Then,?\s+)/i, "").trim();
-	text = text.replace(/^(to\s+)/i, "").trim();
-	if (!text) return undefined;
-	if (/^(start|use|implement|add|change|refactor|extract|split|move|keep|leave|run|write|update|remove|create)\b/i.test(text)) {
-		return text.endsWith(".") ? text : `${text}.`;
-	}
-	return `Implement ${lowerFirst(text).replace(/\.$/, "")}.`;
-}
-
-function extractSpecificAction(assistant: string): string | undefined {
-	const bullet = assistant
-		.split("\n")
-		.map((line) => line.trim())
-		.find((line) => /^[-*]\s+\b(start|use|implement|add|change|refactor|extract|split|move|keep|leave|run|write|update|remove|create)\b/i.test(line));
-	if (bullet) return sentenceToPrompt(bullet);
-
-	const sentences = splitSentences(assistant);
-	const action = sentences.find((sentence) =>
-		/\b(start with|use|implement|add|change|refactor|extract|split|move|keep|leave|run|write|update|remove|create)\b/i.test(sentence),
-	);
-	return action ? sentenceToPrompt(action) : undefined;
-}
-
-function extractConstraint(assistant: string): string | undefined {
-	const sentence = splitSentences(assistant).find((item) => /\b(do not|don't|leave|keep|avoid)\b/i.test(item));
-	if (!sentence) return undefined;
-	const cleaned = cleanSuggestion(sentence)?.replace(/,\s*because\b.*$/i, "");
-	if (!cleaned || cleaned.length > 180) return undefined;
-	return cleaned.replace(/\.$/, "");
-}
-
-function fallbackSuggestion(transcript: string): string | undefined {
-	const assistant = lastTranscriptBlock(transcript, "Assistant") ?? "";
-	const user = lastTranscriptBlock(transcript, "User") ?? "";
-	const combined = `${assistant}\n${user}`;
-
-	if (!combined.trim()) return undefined;
-
-	const recommended = assistant.match(/\brecommended answer:\s*([^.!?]+)[.!?]?/i)?.[1]?.trim();
-	const action = extractSpecificAction(assistant);
-	const constraint = extractConstraint(assistant);
-	if (action) {
-		const prefix = recommended && /^(yes|no)\b/i.test(recommended) ? `${upperFirst(recommended.replace(/\.$/, ""))} - ${lowerFirst(action)}` : action;
-		const precise = constraint && !prefix.toLowerCase().includes(constraint.toLowerCase()) ? `${prefix.replace(/\.$/, "")} and ${lowerFirst(constraint)}.` : prefix;
-		return precise.length > MAX_PROMPT_CHARS ? `${precise.slice(0, MAX_PROMPT_CHARS).trim()}...` : precise;
-	}
-
-	if (/\b(test|tests|spec|suite)\b/i.test(combined)) return "Run the relevant tests and fix any failures.";
-	if (/\?\s*$/.test(assistant) || /\b(open question|clarify|clarification|which option)\b/i.test(assistant)) {
-		return "Answer the open question and continue.";
-	}
-	if (/\b(review|inspect|compare|explain)\b/i.test(user)) return "Apply the next concrete improvement.";
-	return "Continue with the smallest correct next step.";
-}
-
 function buildSuggestionPrompt(transcript: string): string {
 	return [
-		"Suggest the next user prompt for this pi coding-agent conversation.",
-		"Return exactly one prompt the user could send next.",
-		"Keep it short: one sentence, ideally under 12 words.",
-		"Be specific: preserve concrete nouns, file names, function names, decisions, and constraints from the conversation.",
-		"If the assistant recommended an option, phrase the prompt as confirmation plus the exact action, not a generic continuation.",
+		"You are drafting the user's next message in a coding-agent chat.",
+		"Return exactly one short prompt, plain text only.",
+		"Hard limit: 10 words or fewer.",
+		"Write what the user should say next, not a summary of the conversation.",
+		"If the assistant asked a numbered/design question and gave a recommended answer, accept the recommendation and name the concrete change.",
+		"Never restate the question. Never include question numbers, headings, or code fences.",
+		"Prefer terse imperative/confirmation phrasing.",
+		"Bad: Implement question 17: should we remove last_sync_at from Syncer once the stamp file owns that state?",
+		"Good: Yes - remove last_sync_at and add stamp helpers.",
 		"Bad: Continue with the smallest correct next step.",
-		"Good: Yes - implement the independent pair stereo seam and leave feedback ducking separate.",
-		"Do not include explanations, markdown, bullets, quotes, or labels like 'Recommended answer'.",
-		"If there is no useful next prompt, return an empty string.",
+		"Good: Add the Syncer stamp path helper.",
+		"If no useful next prompt exists, return an empty string.",
 		"",
 		"<conversation>",
 		transcript,
@@ -376,8 +297,7 @@ export default function nextPromptExtension(pi: ExtensionAPI) {
 		abortController?.abort();
 		const localGenerationId = ++generationId;
 		abortController = new AbortController();
-		const fallback = fallbackSuggestion(transcript);
-		setSuggestion(ctx, fallback);
+		setSuggestion(ctx, undefined);
 
 		let lastError: unknown;
 		let tried = 0;
@@ -397,7 +317,7 @@ export default function nextPromptExtension(pi: ExtensionAPI) {
 					.filter((part): part is { type: "text"; text: string } => part.type === "text")
 					.map((part) => part.text)
 					.join("\n");
-				const suggestion = cleanSuggestion(raw) ?? fallback;
+				const suggestion = cleanSuggestion(raw);
 				setSuggestion(ctx, suggestion);
 				return;
 			} catch (error) {
@@ -408,16 +328,12 @@ export default function nextPromptExtension(pi: ExtensionAPI) {
 		}
 
 		if (localGenerationId !== generationId || abortController?.signal.aborted) return;
-		setSuggestion(ctx, fallback);
+		setSuggestion(ctx, undefined);
 		if (notifyErrors) {
 			const suffix = lastError instanceof Error ? ` Last error: ${lastError.message}` : "";
 			ctx.ui.notify(
-				fallback
-					? `Using fallback next prompt.${suffix}`
-					: tried > 0
-						? `No working model for next prompt suggestions.${suffix}`
-						: "No available model for next prompt suggestions.",
-				fallback ? "info" : "warning",
+				tried > 0 ? `No working model for next prompt suggestions.${suffix}` : "No available model for next prompt suggestions.",
+				"warning",
 			);
 		}
 	}
