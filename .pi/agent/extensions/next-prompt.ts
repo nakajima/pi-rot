@@ -8,14 +8,18 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { CURSOR_MARKER, truncateToWidth, visibleWidth, type EditorTheme, type TUI } from "@mariozechner/pi-tui";
 
-const VERSION = "2026-05-15.11";
+const VERSION = "2026-05-15.13";
 const STATUS_KEY = "next-prompt";
 const MAX_TRANSCRIPT_CHARS = 8000;
 const MAX_PROMPT_CHARS = 140;
-const FAST_MODEL_HINTS = ["haiku", "mini", "nano", "flash", "lite", "small", "fast", "8b", "4o-mini"];
-const SKIPPED_MODEL_PATTERNS = [/\bclaude-3(?:[-.]|\b)/, /deprecated/];
-const MAX_MODEL_ATTEMPTS = 3;
 const MODEL_TIMEOUT_MS = 8000;
+const SUGGESTION_MODEL_BY_PROVIDER: Record<string, readonly string[]> = {
+	anthropic: ["claude-haiku-4-5"],
+	"openai-codex": ["gpt-5.3-codex-spark"],
+	openai: ["gpt-4.1-mini", "gpt-4o-mini"],
+	google: ["gemini-2.5-flash", "gemini-2.0-flash"],
+	llamacpp: ["default"],
+};
 
 interface TextBlock {
 	type?: string;
@@ -60,8 +64,14 @@ class SuggestedPromptEditor extends CustomEditor {
 
 	override handleInput(data: string): void {
 		const suggestion = this.getSuggestion();
-		if (suggestion && this.getText().trim().length === 0 && this.bindings.matches(data, "tui.input.submit")) {
-			this.setText(suggestion);
+		if (suggestion && this.getText().trim().length === 0) {
+			if (this.bindings.matches(data, "tui.input.submit")) {
+				this.setText(suggestion);
+			} else if (this.bindings.matches(data, "tui.input.tab")) {
+				this.setText(suggestion);
+				this.refresh();
+				return;
+			}
 		}
 		super.handleInput(data);
 	}
@@ -82,9 +92,9 @@ class SuggestedPromptEditor extends CustomEditor {
 		const rightPadding = leftPadding;
 		const marker = this.focused ? CURSOR_MARKER : "";
 		const cursor = `${marker}\x1b[7m \x1b[0m`;
-		const availablePlaceholderWidth = Math.max(0, contentWidth - 2);
+		const availablePlaceholderWidth = Math.max(0, contentWidth - 1);
 		const placeholder = truncateToWidth(suggestion, availablePlaceholderWidth, "...");
-		const styledPlaceholder = placeholder ? ` ${this.stylePlaceholder(placeholder)}` : "";
+		const styledPlaceholder = placeholder ? this.stylePlaceholder(placeholder) : "";
 		const displayText = `${cursor}${styledPlaceholder}`;
 		const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(displayText)));
 
@@ -147,32 +157,28 @@ function buildTranscript(entries: readonly SessionEntryLike[]): string {
 	);
 }
 
-function isFastModel(model: Model<Api>): boolean {
-	const label = `${model.provider}/${model.id} ${model.name}`.toLowerCase();
-	return FAST_MODEL_HINTS.some((hint) => label.includes(hint));
+function fixedSuggestionModel(ctx: ExtensionContext): Model<Api> | undefined {
+	const provider = ctx.model?.provider;
+	if (!provider) return undefined;
+
+	const models = ctx.modelRegistry.getAvailable().filter((model) => model.provider === provider && model.input.includes("text"));
+	const fixedIds = SUGGESTION_MODEL_BY_PROVIDER[provider];
+	if (fixedIds) {
+		for (const id of fixedIds) {
+			const model = models.find((candidate) => candidate.id === id);
+			if (model) return model;
+		}
+		return undefined;
+	}
+
+	return ctx.model?.input.includes("text") ? ctx.model : undefined;
 }
 
-function isSkippedModel(model: Model<Api>): boolean {
-	const label = `${model.provider}/${model.id} ${model.name}`.toLowerCase();
-	return SKIPPED_MODEL_PATTERNS.some((pattern) => pattern.test(label));
-}
-
-function modelScore(model: Model<Api>, currentProvider?: string): number {
-	const label = `${model.provider}/${model.id} ${model.name}`.toLowerCase();
-	let score = isFastModel(model) ? 100 : 0;
-	if (model.provider === currentProvider) score += 20;
-	if (label.includes("haiku-4-5") || label.includes("haiku-4")) score += 60;
-	if (label.includes("gpt-5") && label.includes("mini")) score += 50;
-	if (label.includes("spark")) score += 45;
-	if (label.includes("flash")) score += 40;
-	if (label.includes("4o-mini") || label.includes("4.1-mini")) score += 30;
-	return score;
-}
-
-function candidateModels(ctx: ExtensionContext): Model<Api>[] {
-	return [...ctx.modelRegistry.getAvailable().filter((model) => model.input.includes("text") && !isSkippedModel(model))]
-		.sort((a, b) => modelScore(b, ctx.model?.provider) - modelScore(a, ctx.model?.provider))
-		.slice(0, MAX_MODEL_ATTEMPTS);
+function suggestionModelLabel(ctx: ExtensionContext): string {
+	const provider = ctx.model?.provider;
+	const model = fixedSuggestionModel(ctx);
+	if (model) return `${model.provider}/${model.id}`;
+	return provider ? `none for provider ${provider}` : "none; no current provider";
 }
 
 async function resolveModel(ctx: ExtensionContext, model: Model<Api>): Promise<ResolvedModel | undefined> {
@@ -181,10 +187,20 @@ async function resolveModel(ctx: ExtensionContext, model: Model<Api>): Promise<R
 }
 
 class SuggestionTimeoutError extends Error {
-	constructor(model: Model<Api>) {
-		super(`Timed out waiting for ${model.provider}/${model.id}`);
+	constructor(label: string) {
+		super(`Timed out waiting for ${label}`);
 		this.name = "SuggestionTimeoutError";
 	}
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+	let timeoutId: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<never>((_resolve, reject) => {
+		timeoutId = setTimeout(() => reject(new SuggestionTimeoutError(label)), timeoutMs);
+	});
+	return Promise.race([promise, timeout]).finally(() => {
+		if (timeoutId) clearTimeout(timeoutId);
+	});
 }
 
 async function completeSuggestion(resolved: ResolvedModel, transcript: string, signal: AbortSignal): Promise<AssistantMessage> {
@@ -229,7 +245,7 @@ async function completeSuggestion(resolved: ResolvedModel, transcript: string, s
 	const timeout = new Promise<never>((_resolve, reject) => {
 		timeoutId = setTimeout(() => {
 			controller.abort();
-			reject(new SuggestionTimeoutError(resolved.model));
+			reject(new SuggestionTimeoutError(`${resolved.model.provider}/${resolved.model.id}`));
 		}, MODEL_TIMEOUT_MS);
 	});
 
@@ -301,44 +317,43 @@ export default function nextPromptExtension(pi: ExtensionAPI) {
 		setSuggestion(ctx, undefined);
 
 		let lastError: unknown;
-		let tried = 0;
-		const models = candidateModels(ctx);
-		for (const model of models) {
+		const model = fixedSuggestionModel(ctx);
+		if (!model) {
+			if (notifyErrors) ctx.ui.notify(`No fixed next prompt model for ${ctx.model?.provider ?? "the current provider"}.`, "warning");
+			return;
+		}
+
+		try {
+			const resolved = await withTimeout(resolveModel(ctx, model), MODEL_TIMEOUT_MS, `${model.provider}/${model.id} auth`);
+			if (localGenerationId !== generationId || abortController.signal.aborted) return;
+			if (!resolved) {
+				if (notifyErrors) ctx.ui.notify(`No auth for next prompt model ${model.provider}/${model.id}.`, "warning");
+				return;
+			}
+
+			const response = await completeSuggestion(resolved, transcript, abortController.signal);
 			if (localGenerationId !== generationId || abortController.signal.aborted) return;
 
-			const resolved = await resolveModel(ctx, model);
-			if (!resolved) continue;
-			tried++;
-
-			try {
-				const response = await completeSuggestion(resolved, transcript, abortController.signal);
-				if (localGenerationId !== generationId || abortController.signal.aborted) return;
-
-				const raw = response.content
-					.filter((part): part is { type: "text"; text: string } => part.type === "text")
-					.map((part) => part.text)
-					.join("\n");
-				const suggestion = cleanSuggestion(raw);
-				if (suggestion) {
-					setSuggestion(ctx, suggestion);
-					return;
-				}
-				lastError = new Error("Suggestion model returned an empty prompt.");
-			} catch (error) {
-				if (localGenerationId !== generationId || abortController.signal.aborted) return;
-				lastError = error;
-				if (error instanceof SuggestionTimeoutError) break;
+			const raw = response.content
+				.filter((part): part is { type: "text"; text: string } => part.type === "text")
+				.map((part) => part.text)
+				.join("\n");
+			const suggestion = cleanSuggestion(raw);
+			if (suggestion) {
+				setSuggestion(ctx, suggestion);
+				return;
 			}
+			lastError = new Error("Suggestion model returned an empty prompt.");
+		} catch (error) {
+			if (localGenerationId !== generationId || abortController.signal.aborted) return;
+			lastError = error;
 		}
 
 		if (localGenerationId !== generationId || abortController?.signal.aborted) return;
 		setSuggestion(ctx, undefined);
 		if (notifyErrors) {
 			const suffix = lastError instanceof Error ? ` Last error: ${lastError.message}` : "";
-			ctx.ui.notify(
-				tried > 0 ? `No working model for next prompt suggestions.${suffix}` : "No available model for next prompt suggestions.",
-				"warning",
-			);
+			ctx.ui.notify(`No next prompt from ${model.provider}/${model.id}.${suffix}`, "warning");
 		}
 	}
 
@@ -389,8 +404,7 @@ export default function nextPromptExtension(pi: ExtensionAPI) {
 				return;
 			}
 			if (command === "models") {
-				const models = candidateModels(ctx).map((model) => `${model.provider}/${model.id}`);
-				ctx.ui.notify(models.length > 0 ? `Next prompt candidates: ${models.join(", ")}` : "No next prompt candidates found.", "info");
+				ctx.ui.notify(`Next prompt model: ${suggestionModelLabel(ctx)}`, "info");
 				return;
 			}
 			if (command === "version") {
