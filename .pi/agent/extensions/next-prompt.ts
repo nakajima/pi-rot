@@ -8,7 +8,7 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { CURSOR_MARKER, truncateToWidth, visibleWidth, type EditorTheme, type TUI } from "@mariozechner/pi-tui";
 
-const VERSION = "2026-05-15.13";
+const VERSION = "2026-05-15.14";
 const STATUS_KEY = "next-prompt";
 const MAX_TRANSCRIPT_CHARS = 8000;
 const MAX_PROMPT_CHARS = 140;
@@ -45,6 +45,23 @@ interface ResolvedModel {
 		apiKey?: string;
 		headers?: Record<string, string>;
 	};
+}
+
+interface SuggestionDebugState {
+	status: "idle" | "generating" | "set" | "empty" | "error" | "skipped" | "cleared" | "aborted";
+	lastEvent?: string;
+	trigger?: "agent_end" | "manual" | "clear" | "agent_start";
+	currentProvider?: string;
+	model?: string;
+	transcriptChars?: number;
+	startedAt?: number;
+	finishedAt?: number;
+	latencyMs?: number;
+	rawPreview?: string;
+	suggestion?: string;
+	error?: string;
+	note?: string;
+	generationId?: number;
 }
 
 class SuggestedPromptEditor extends CustomEditor {
@@ -266,6 +283,25 @@ function cleanSuggestion(raw: string): string | undefined {
 	return text.length > MAX_PROMPT_CHARS ? `${text.slice(0, MAX_PROMPT_CHARS).trim()}...` : text;
 }
 
+function modelLabel(model: Model<Api>): string {
+	return `${model.provider}/${model.id}`;
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function preview(text: string | undefined, maxLength = 160): string | undefined {
+	if (!text) return undefined;
+	const normalized = text.replace(/\s+/g, " ").trim();
+	return normalized.length > maxLength ? `${normalized.slice(0, maxLength).trim()}...` : normalized;
+}
+
+function formatLatency(ms: number | undefined): string {
+	if (ms === undefined) return "n/a";
+	return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+}
+
 function buildSuggestionPrompt(transcript: string): string {
 	return [
 		"You are drafting the user's next message in a coding-agent chat.",
@@ -293,46 +329,134 @@ export default function nextPromptExtension(pi: ExtensionAPI) {
 	let activeEditor: SuggestedPromptEditor | undefined;
 	let generationId = 0;
 	let abortController: AbortController | undefined;
+	let statusClearTimer: ReturnType<typeof setTimeout> | undefined;
+	let lastDebug: SuggestionDebugState = { status: "idle", note: "extension loaded" };
 
-	function setSuggestion(ctx: ExtensionContext, suggestion: string | undefined, status?: string): void {
-		currentSuggestion = suggestion;
-		activeEditor?.refresh();
-		if (ctx.hasUI) {
-			ctx.ui.setStatus(STATUS_KEY, status);
+	function setStatus(ctx: ExtensionContext, status: string | undefined): void {
+		if (statusClearTimer) {
+			clearTimeout(statusClearTimer);
+			statusClearTimer = undefined;
 		}
+		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, status);
 	}
 
-	async function generateSuggestion(ctx: ExtensionContext, notifyErrors: boolean, transcriptOverride?: string): Promise<void> {
-		if (!ctx.hasUI || !activeEditor) return;
+	function setTransientStatus(ctx: ExtensionContext, status: string, localGenerationId: number): void {
+		setStatus(ctx, status);
+		statusClearTimer = setTimeout(() => {
+			if (localGenerationId === generationId && ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
+			statusClearTimer = undefined;
+		}, 2500);
+	}
+
+	function setSuggestion(ctx: ExtensionContext, suggestion: string | undefined): void {
+		currentSuggestion = suggestion;
+		activeEditor?.refresh();
+	}
+
+	function finishDebug(status: SuggestionDebugState["status"], update: Partial<SuggestionDebugState> = {}): void {
+		const finishedAt = Date.now();
+		lastDebug = {
+			...lastDebug,
+			...update,
+			status,
+			finishedAt,
+			latencyMs: lastDebug.startedAt ? finishedAt - lastDebug.startedAt : undefined,
+		};
+	}
+
+	function formatDebug(ctx: ExtensionContext): string {
+		return [
+			`next-prompt ${VERSION}`,
+			`status: ${lastDebug.status}`,
+			`last event: ${lastDebug.lastEvent ?? "none"}`,
+			`trigger: ${lastDebug.trigger ?? "none"}`,
+			`provider: ${lastDebug.currentProvider ?? ctx.model?.provider ?? "none"}`,
+			`model: ${lastDebug.model ?? suggestionModelLabel(ctx)}`,
+			`transcript chars: ${lastDebug.transcriptChars ?? 0}`,
+			`latency: ${formatLatency(lastDebug.latencyMs)}`,
+			`editor active: ${activeEditor ? "yes" : "no"}`,
+			`editor text chars: ${activeEditor?.getText().length ?? "n/a"}`,
+			`current suggestion: ${currentSuggestion ?? "none"}`,
+			`last suggestion: ${lastDebug.suggestion ?? "none"}`,
+			`raw preview: ${lastDebug.rawPreview ?? "none"}`,
+			`error: ${lastDebug.error ?? "none"}`,
+			`note: ${lastDebug.note ?? "none"}`,
+		].join("\n");
+	}
+
+	async function generateSuggestion(
+		ctx: ExtensionContext,
+		notifyErrors: boolean,
+		trigger: "agent_end" | "manual" = "manual",
+		transcriptOverride?: string,
+	): Promise<void> {
+		if (!ctx.hasUI || !activeEditor) {
+			lastDebug = {
+				status: "skipped",
+				lastEvent: trigger,
+				trigger,
+				currentProvider: ctx.model?.provider,
+				note: !ctx.hasUI ? "no UI" : "editor not active",
+			};
+			return;
+		}
 
 		const transcript = transcriptOverride?.trim() || buildTranscript(ctx.sessionManager.getBranch() as readonly SessionEntryLike[]);
+		const startedAt = Date.now();
+		lastDebug = {
+			status: "generating",
+			lastEvent: trigger,
+			trigger,
+			currentProvider: ctx.model?.provider,
+			transcriptChars: transcript.length,
+			startedAt,
+			note: undefined,
+			error: undefined,
+			rawPreview: undefined,
+			suggestion: undefined,
+		};
+
 		if (!transcript.trim()) {
 			setSuggestion(ctx, undefined);
+			finishDebug("skipped", { note: "empty transcript" });
 			return;
 		}
 
 		abortController?.abort();
 		const localGenerationId = ++generationId;
 		abortController = new AbortController();
+		lastDebug = { ...lastDebug, generationId: localGenerationId };
 		setSuggestion(ctx, undefined);
 
-		let lastError: unknown;
+		let finalStatus: string | undefined;
 		const model = fixedSuggestionModel(ctx);
 		if (!model) {
-			if (notifyErrors) ctx.ui.notify(`No fixed next prompt model for ${ctx.model?.provider ?? "the current provider"}.`, "warning");
+			finishDebug("error", { error: `No fixed next prompt model for ${ctx.model?.provider ?? "the current provider"}.` });
+			if (notifyErrors) ctx.ui.notify(lastDebug.error ?? "No fixed next prompt model.", "warning");
 			return;
 		}
 
+		const label = modelLabel(model);
+		lastDebug = { ...lastDebug, model: label };
+		setStatus(ctx, `suggesting ${model.id}...`);
+
 		try {
-			const resolved = await withTimeout(resolveModel(ctx, model), MODEL_TIMEOUT_MS, `${model.provider}/${model.id} auth`);
-			if (localGenerationId !== generationId || abortController.signal.aborted) return;
+			const resolved = await withTimeout(resolveModel(ctx, model), MODEL_TIMEOUT_MS, `${label} auth`);
+			if (localGenerationId !== generationId || abortController.signal.aborted) {
+				finishDebug("aborted", { note: "superseded during auth" });
+				return;
+			}
 			if (!resolved) {
-				if (notifyErrors) ctx.ui.notify(`No auth for next prompt model ${model.provider}/${model.id}.`, "warning");
+				finishDebug("error", { error: `No auth for next prompt model ${label}.` });
+				if (notifyErrors) ctx.ui.notify(lastDebug.error ?? `No auth for next prompt model ${label}.`, "warning");
 				return;
 			}
 
 			const response = await completeSuggestion(resolved, transcript, abortController.signal);
-			if (localGenerationId !== generationId || abortController.signal.aborted) return;
+			if (localGenerationId !== generationId || abortController.signal.aborted) {
+				finishDebug("aborted", { note: "superseded during completion" });
+				return;
+			}
 
 			const raw = response.content
 				.filter((part): part is { type: "text"; text: string } => part.type === "text")
@@ -341,30 +465,54 @@ export default function nextPromptExtension(pi: ExtensionAPI) {
 			const suggestion = cleanSuggestion(raw);
 			if (suggestion) {
 				setSuggestion(ctx, suggestion);
+				finishDebug("set", { rawPreview: preview(raw), suggestion });
+				finalStatus = `next prompt set ${formatLatency(lastDebug.latencyMs)}`;
 				return;
 			}
-			lastError = new Error("Suggestion model returned an empty prompt.");
+			finishDebug("empty", { rawPreview: preview(raw), error: "Suggestion model returned an empty prompt." });
+			finalStatus = "next prompt empty";
 		} catch (error) {
-			if (localGenerationId !== generationId || abortController.signal.aborted) return;
-			lastError = error;
+			if (localGenerationId !== generationId || abortController.signal.aborted) {
+				finishDebug("aborted", { error: errorMessage(error) });
+				return;
+			}
+			finishDebug("error", { error: errorMessage(error) });
+			finalStatus = "next prompt failed";
+		}
+		finally {
+			if (localGenerationId === generationId) {
+				if (finalStatus) setTransientStatus(ctx, finalStatus, localGenerationId);
+				else setStatus(ctx, undefined);
+			}
 		}
 
 		if (localGenerationId !== generationId || abortController?.signal.aborted) return;
 		setSuggestion(ctx, undefined);
 		if (notifyErrors) {
-			const suffix = lastError instanceof Error ? ` Last error: ${lastError.message}` : "";
-			ctx.ui.notify(`No next prompt from ${model.provider}/${model.id}.${suffix}`, "warning");
+			const suffix = lastDebug.error ? ` Last error: ${lastDebug.error}` : "";
+			ctx.ui.notify(`No next prompt from ${label}.${suffix}`, "warning");
 		}
 	}
 
-	function clearSuggestion(ctx: ExtensionContext): void {
+	function clearSuggestion(ctx: ExtensionContext, trigger: "clear" | "agent_start" = "clear"): void {
 		generationId++;
 		abortController?.abort();
 		abortController = undefined;
+		setStatus(ctx, undefined);
 		setSuggestion(ctx, undefined);
+		lastDebug = {
+			...lastDebug,
+			status: "cleared",
+			lastEvent: trigger,
+			trigger,
+			currentProvider: ctx.model?.provider,
+			finishedAt: Date.now(),
+			note: trigger === "agent_start" ? "cleared for new agent run" : "cleared by command",
+		};
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+		lastDebug = { ...lastDebug, lastEvent: "session_start", currentProvider: ctx.model?.provider };
 		if (!ctx.hasUI) return;
 		ctx.ui.setEditorComponent((tui, theme, keybindings) => {
 			activeEditor = new SuggestedPromptEditor(
@@ -379,20 +527,26 @@ export default function nextPromptExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_start", (_event, ctx) => {
-		clearSuggestion(ctx);
+		clearSuggestion(ctx, "agent_start");
 	});
 
 	pi.on("agent_end", (event, ctx) => {
 		const transcript = buildTranscriptFromMessages(event.messages as readonly MessageLike[]);
-		void generateSuggestion(ctx, false, transcript).catch(() => undefined);
+		void generateSuggestion(ctx, false, "agent_end", transcript).catch((error) => {
+			finishDebug("error", { error: errorMessage(error), note: "unhandled generation error" });
+			setStatus(ctx, undefined);
+		});
 	});
 
 	pi.on("session_shutdown", (_event, _ctx) => {
 		generationId++;
 		abortController?.abort();
 		abortController = undefined;
+		if (statusClearTimer) clearTimeout(statusClearTimer);
+		statusClearTimer = undefined;
 		activeEditor = undefined;
 		currentSuggestion = undefined;
+		lastDebug = { ...lastDebug, status: "aborted", lastEvent: "session_shutdown", finishedAt: Date.now(), note: "session shutdown" };
 	});
 
 	pi.registerCommand("next-prompt", {
@@ -411,7 +565,11 @@ export default function nextPromptExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(`next-prompt ${VERSION}`, "info");
 				return;
 			}
-			await generateSuggestion(ctx, true);
+			if (command === "debug") {
+				ctx.ui.notify(formatDebug(ctx), "info");
+				return;
+			}
+			await generateSuggestion(ctx, true, "manual");
 		},
 	});
 }
