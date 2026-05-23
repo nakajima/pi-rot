@@ -8,14 +8,14 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { CURSOR_MARKER, truncateToWidth, visibleWidth, type EditorTheme, type TUI } from "@mariozechner/pi-tui";
 
-const VERSION = "2026-05-15.14";
+const VERSION = "2026-05-15.23";
 const STATUS_KEY = "next-prompt";
 const MAX_TRANSCRIPT_CHARS = 8000;
 const MAX_PROMPT_CHARS = 140;
 const MODEL_TIMEOUT_MS = 8000;
 const SUGGESTION_MODEL_BY_PROVIDER: Record<string, readonly string[]> = {
 	anthropic: ["claude-haiku-4-5"],
-	"openai-codex": ["gpt-5.3-codex-spark"],
+	"openai-codex": ["gpt-5.4-mini", "gpt-5.5"],
 	openai: ["gpt-4.1-mini", "gpt-4o-mini"],
 	google: ["gemini-2.5-flash", "gemini-2.0-flash"],
 	llamacpp: ["default"],
@@ -59,6 +59,10 @@ interface SuggestionDebugState {
 	latencyMs?: number;
 	rawPreview?: string;
 	suggestion?: string;
+	stopReason?: string;
+	contentTypes?: string;
+	outputTokens?: number;
+	transport?: string;
 	error?: string;
 	note?: string;
 	generationId?: number;
@@ -220,6 +224,20 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
 	});
 }
 
+function fixCodexPayloadWithoutTools(payload: unknown, model: Model<Api>): unknown | undefined {
+	if (model.api !== "openai-codex-responses" || !payload || typeof payload !== "object" || Array.isArray(payload)) {
+		return undefined;
+	}
+
+	const body = payload as Record<string, unknown>;
+	if (Array.isArray(body.tools) && body.tools.length > 0) return undefined;
+
+	const next = { ...body };
+	delete next.tool_choice;
+	delete next.parallel_tool_calls;
+	return next;
+}
+
 async function completeSuggestion(resolved: ResolvedModel, transcript: string, signal: AbortSignal): Promise<AssistantMessage> {
 	const controller = new AbortController();
 	const abort = () => controller.abort();
@@ -242,16 +260,18 @@ async function completeSuggestion(resolved: ResolvedModel, transcript: string, s
 		{
 			apiKey: resolved.auth.apiKey,
 			headers: resolved.auth.headers,
-			maxTokens: 48,
-			temperature: 0.2,
+			maxTokens: 64,
+			temperature: resolved.model.api === "openai-codex-responses" ? undefined : 0.2,
 			maxRetries: 0,
 			timeoutMs: MODEL_TIMEOUT_MS,
-			reasoningEffort: resolved.model.api === "openai-codex-responses" ? "none" : "minimal",
-			reasoningSummary: resolved.model.api === "openai-codex-responses" ? "off" : null,
+			transport: "sse",
+			reasoningEffort: "minimal",
+			reasoningSummary: null,
 			textVerbosity: "low",
 			thinkingEnabled: false,
 			effort: "low",
 			thinkingDisplay: "omitted",
+			onPayload: (payload) => fixCodexPayloadWithoutTools(payload, resolved.model),
 			signal: controller.signal,
 		},
 	).finally(() => {
@@ -309,10 +329,12 @@ function buildSuggestionPrompt(transcript: string): string {
 		"Hard limit: 10 words or fewer.",
 		"Write what the user should say next, not a summary of the conversation.",
 		"If the assistant asked a numbered/design question and gave a recommended answer, accept the recommendation and name the concrete change.",
+		"For option lists, prefer the recommended option's name plus its action.",
 		"Never restate the question. Never include question numbers, headings, or code fences.",
 		"Prefer terse imperative/confirmation phrasing.",
 		"Bad: Implement question 17: should we remove last_sync_at from Syncer once the stamp file owns that state?",
 		"Good: Yes - remove last_sync_at and add stamp helpers.",
+		"Good: Use endpoint-based file handling.",
 		"Bad: Continue with the smallest correct next step.",
 		"Good: Add the Syncer stamp path helper.",
 		"If uncertain, choose the safest concrete continuation.",
@@ -379,6 +401,10 @@ export default function nextPromptExtension(pi: ExtensionAPI) {
 			`current suggestion: ${currentSuggestion ?? "none"}`,
 			`last suggestion: ${lastDebug.suggestion ?? "none"}`,
 			`raw preview: ${lastDebug.rawPreview ?? "none"}`,
+			`stop reason: ${lastDebug.stopReason ?? "none"}`,
+			`content types: ${lastDebug.contentTypes ?? "none"}`,
+			`output tokens: ${lastDebug.outputTokens ?? "none"}`,
+			`transport: ${lastDebug.transport ?? "sse"}`,
 			`error: ${lastDebug.error ?? "none"}`,
 			`note: ${lastDebug.note ?? "none"}`,
 		].join("\n");
@@ -414,6 +440,10 @@ export default function nextPromptExtension(pi: ExtensionAPI) {
 			error: undefined,
 			rawPreview: undefined,
 			suggestion: undefined,
+			stopReason: undefined,
+			contentTypes: undefined,
+			outputTokens: undefined,
+			transport: "sse",
 		};
 
 		if (!transcript.trim()) {
@@ -437,7 +467,7 @@ export default function nextPromptExtension(pi: ExtensionAPI) {
 		}
 
 		const label = modelLabel(model);
-		lastDebug = { ...lastDebug, model: label };
+		lastDebug = { ...lastDebug, model: label, transport: "sse" };
 		setStatus(ctx, `suggesting ${model.id}...`);
 
 		try {
@@ -458,19 +488,29 @@ export default function nextPromptExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			const raw = response.content
-				.filter((part): part is { type: "text"; text: string } => part.type === "text")
-				.map((part) => part.text)
-				.join("\n");
-			const suggestion = cleanSuggestion(raw);
-			if (suggestion) {
-				setSuggestion(ctx, suggestion);
-				finishDebug("set", { rawPreview: preview(raw), suggestion });
-				finalStatus = `next prompt set ${formatLatency(lastDebug.latencyMs)}`;
-				return;
+			const responseDebug = {
+				stopReason: response.stopReason,
+				contentTypes: response.content.map((part) => part.type).join(", ") || "none",
+				outputTokens: response.usage.output,
+			};
+			if (response.stopReason === "error") {
+				finishDebug("error", { ...responseDebug, error: response.errorMessage || "Provider returned an error without a message." });
+				finalStatus = "next prompt failed";
+			} else {
+				const raw = response.content
+					.filter((part): part is { type: "text"; text: string } => part.type === "text")
+					.map((part) => part.text)
+					.join("\n");
+				const suggestion = cleanSuggestion(raw);
+				if (suggestion) {
+					setSuggestion(ctx, suggestion);
+					finishDebug("set", { ...responseDebug, rawPreview: preview(raw), suggestion });
+					finalStatus = `next prompt set ${formatLatency(lastDebug.latencyMs)}`;
+					return;
+				}
+				finishDebug("empty", { ...responseDebug, rawPreview: preview(raw), error: "Suggestion model returned an empty prompt." });
+				finalStatus = "next prompt empty";
 			}
-			finishDebug("empty", { rawPreview: preview(raw), error: "Suggestion model returned an empty prompt." });
-			finalStatus = "next prompt empty";
 		} catch (error) {
 			if (localGenerationId !== generationId || abortController.signal.aborted) {
 				finishDebug("aborted", { error: errorMessage(error) });
